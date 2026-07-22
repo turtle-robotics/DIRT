@@ -17,8 +17,17 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from pathlib import Path
+from types import SimpleNamespace
 
-from config import CFG, Platform
+# Allow running this module directly (for quick debugging) by making the
+# project root available on sys.path if `config` can't be imported normally.
+try:
+    from config import CFG, Platform
+except ModuleNotFoundError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from config import CFG, Platform
 
 log = logging.getLogger(__name__)
 
@@ -109,12 +118,13 @@ class AS7265xDriver:
         self._bus = smbus2.SMBus(bus_id)
         # cfg may be None when running on non-hardware machines; provide defaults
         if cfg is None:
-            class _C: pass
-            cfg = _C()
+            cfg = SimpleNamespace()
             cfg.i2c_address = AS7265X_ADDR
             cfg.gain = 1
             cfg.integration = 1
             cfg.led_current = 1
+            cfg.num_samples = 3
+            cfg.wavelengths = WAVELENGTHS_NM
         self._addr = getattr(cfg, "i2c_address", AS7265X_ADDR)
         self._cfg = cfg
         # perform initial configuration (gain, integration, leds)
@@ -269,11 +279,15 @@ class SoilPLSModel:
             from sklearn.preprocessing import StandardScaler  # noqa: F401
         except Exception:
             log.warning("scikit-learn not available: model training/prediction disabled")
+            # Provide a lightweight numpy fallback so the simulation still works
             self._pls = None
             self._scaler = None
             self.n_components = n_components
             self._trained = False
             self._X_train = None
+            self._coeffs = None
+            self._X_mean = None
+            self._X_std = None
             return
 
         from sklearn.cross_decomposition import PLSRegression
@@ -286,22 +300,71 @@ class SoilPLSModel:
         self._X_train: Optional[np.ndarray] = None
 
     def fit(self, X_raw: np.ndarray, y: np.ndarray):
-        if self._pls is None:
-            raise RuntimeError("scikit-learn required to train model")
         X_pre = np.apply_along_axis(preprocess, 1, X_raw)
-        X_sc = self._scaler.fit_transform(X_pre)
-        self._pls.fit(X_sc, y)
+        # If sklearn is available use the PLS pipeline
+        if self._pls is not None and self._scaler is not None:
+            X_sc = self._scaler.fit_transform(X_pre)
+            self._pls.fit(X_sc, y)
+            self._X_train = X_sc
+            self._trained = True
+            log.info("PLS model fitted: %d samples, %d components", len(X_raw), self.n_components)
+            return
+
+        # Numpy fallback: standardize and fit linear least-squares for each target
+        X_mean = X_pre.mean(axis=0)
+        X_std = X_pre.std(axis=0) + 1e-9
+        X_sc = (X_pre - X_mean) / X_std
+        # Add intercept column
+        X_aug = np.hstack([np.ones((X_sc.shape[0], 1)), X_sc])
+        # Solve least-squares for each target column
+        coeffs, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
+        # coeffs shape: (n_features+1, n_targets)
+        self._coeffs = coeffs
+        self._X_mean = X_mean
+        self._X_std = X_std
         self._X_train = X_sc
         self._trained = True
-        log.info("PLS model fitted: %d samples, %d components", len(X_raw), self.n_components)
+        log.info("Fallback linear model fitted: %d samples", len(X_raw))
 
     def predict(self, spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
-        if not self._trained or self._pls is None:
-            raise RuntimeError("Model not trained or sklearn not installed")
-        x_pre = preprocess(spectrum).reshape(1, -1)
-        x_sc = self._scaler.transform(x_pre)
-        y_hat = self._pls.predict(x_sc)[0]
-        conf = self._hotelling_confidence(x_sc)
+        if not self._trained:
+            raise RuntimeError("Model not trained")
+
+        x_pre = preprocess(spectrum)
+        # If we have sklearn PLS, use it
+        if self._pls is not None and self._scaler is not None:
+            x_pre = x_pre.reshape(1, -1)
+            x_sc = self._scaler.transform(x_pre)
+            y_hat = self._pls.predict(x_sc)[0]
+            conf = self._hotelling_confidence(x_sc)
+            return y_hat, conf
+
+        # Numpy fallback prediction using least-squares coeffs
+        if self._coeffs is None:
+            raise RuntimeError("Fallback model coefficients missing; model not trained")
+
+        # Ensure statistics from training exist and have compatible shape
+        if self._X_mean is None or self._X_std is None:
+            raise RuntimeError("Fallback model stats missing; model not trained for numpy fallback")
+        x_pre_arr = np.asarray(x_pre).ravel()
+        mean_arr = np.asarray(self._X_mean).ravel()
+        std_arr = np.asarray(self._X_std).ravel()
+        if x_pre_arr.shape[0] != mean_arr.shape[0] or x_pre_arr.shape[0] != std_arr.shape[0]:
+            raise RuntimeError(
+                f"Fallback prediction shape mismatch: spectrum_len={x_pre_arr.shape[0]} mean_len={mean_arr.shape[0]} std_len={std_arr.shape[0]}"
+            )
+        x_sc = (x_pre_arr - mean_arr) / (std_arr + 1e-9)
+        # Make augmented vector: [1.0, x_sc...] as 1D float array
+        x_aug = np.concatenate([np.array([1.0], dtype=float), np.asarray(x_sc).ravel().astype(float)])
+
+        try:
+            y_hat = x_aug @ self._coeffs
+        except Exception as exc:
+            raise RuntimeError(
+                f"Fallback prediction failed: x_aug.shape={x_aug.shape} coeffs_shape={getattr(self._coeffs, 'shape', None)} -> {exc}"
+            ) from exc
+
+        conf = self._hotelling_confidence(x_sc.reshape(1, -1))
         return y_hat, conf
 
     def _hotelling_confidence(self, x_sc: np.ndarray) -> float:
@@ -340,9 +403,9 @@ class Spectrometer:
     def __init__(self, cfg=None):
         # allow None so code runs without a CFG.spectrometer attribute
         if cfg is None:
-            class _C: pass
-            cfg = _C()
+            cfg = SimpleNamespace()
             cfg.num_samples = 3
+            cfg.wavelengths = WAVELENGTHS_NM
         self.cfg = cfg
         self._driver = _make_driver()
         self._model = SoilPLSModel()
