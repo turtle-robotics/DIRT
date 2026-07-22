@@ -1,0 +1,5 @@
+# Ignore large local model files
+*.bin
+*.pt
+pytorch_model.bin
+transformers_cache/

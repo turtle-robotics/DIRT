@@ -1,0 +1,8 @@
+numpy
+opencv-python
+gpiozero
+scikit-learn
+smbus2
+pyserial
+RPi.GPIO; platform_system=="Linux"
+rclpy; extra == "ros"
