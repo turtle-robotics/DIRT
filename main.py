@@ -96,6 +96,13 @@ def _run_navigation_test():
     nav.run_demo(ticks=120)
 
 
+def _run_rover_3d_test():
+    """Full 3D rover motion demo over terrain."""
+    from simulation.rover_3d_sim import run_rover_3d_demo
+    log.info("Running 3D rover demo…")
+    run_rover_3d_demo(show_video=True, save_csv=True)
+
+
 def _load_waypoints_csv(path: str):
     """Load waypoints from a CSV with columns: name,lat,lon"""
     from navigation.navigator import Waypoint, GPSCoord
@@ -210,7 +217,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DIRT Bot")
     parser.add_argument(
         "--test",
-        choices=["alignment", "spectrometer", "distance", "navigation"],
+        choices=["alignment", "spectrometer", "distance", "navigation", "rover3d"],
         help="Run a single subsystem test",
     )
     parser.add_argument(
@@ -234,6 +241,8 @@ if __name__ == "__main__":
         _run_distance_test()
     elif args.test == "navigation":
         _run_navigation_test()
+    elif args.test == "rover3d":
+        _run_rover_3d_test()
     elif args.sweep:
         from simulation.alignment_sim import run_parameter_sweep
         run_parameter_sweep()
