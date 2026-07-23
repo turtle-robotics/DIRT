@@ -218,6 +218,11 @@ class Rover3DSim:
         self.manual_throttle = 0.0
         self.manual_steer = 0.0
         self._bounds = terrain_span_m / 2.0
+        self._background_cache: dict[Tuple[int, int], np.ndarray] = {}
+        self._terrain_fill_cache: dict[Tuple[str, float], List[Tuple[Tuple[Tuple[float, float, float], ...], Tuple[int, int, int]]]] = {}
+        self._terrain_cache: dict[Tuple[str, float], List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[int, int, int]]]] = {}
+        self._minimap_base_cache: dict[Tuple[int, int], np.ndarray] = {}
+        self._history_base_cache: dict[Tuple[int, int], np.ndarray] = {}
         self.state.z = self.terrain.height(self.state.x, self.state.y)
 
     def _default_waypoints(self) -> List[Waypoint3D]:
@@ -447,51 +452,72 @@ class Rover3DSim:
             return
         cv2.line(canvas, (a[0], a[1]), (b[0], b[1]), colour, thickness, cv2.LINE_AA)
 
+    def _fill_polygon_3d(
+        self,
+        canvas: np.ndarray,
+        points: Sequence[Tuple[float, float, float]],
+        colour: Tuple[int, int, int],
+        camera_pos: np.ndarray,
+        camera_target: np.ndarray,
+        camera_up: np.ndarray,
+        focal: float,
+    ) -> None:
+        h, w = canvas.shape[:2]
+        projected: List[Tuple[int, int]] = []
+        for point in points:
+            result = self._project(point, camera_pos, camera_target, camera_up, w, h, focal)
+            if result is None:
+                return
+            projected.append((result[0], result[1]))
+        cv2.fillConvexPoly(canvas, np.array(projected, dtype=np.int32), colour, cv2.LINE_AA)
+
+    def _projected_radius(
+        self,
+        point: Tuple[float, float, float],
+        offset: Tuple[float, float, float],
+        camera_pos: np.ndarray,
+        camera_target: np.ndarray,
+        camera_up: np.ndarray,
+        focal: float,
+        width: int,
+        height: int,
+    ) -> Optional[int]:
+        base = self._project(point, camera_pos, camera_target, camera_up, width, height, focal)
+        other = self._project((point[0] + offset[0], point[1] + offset[1], point[2] + offset[2]), camera_pos, camera_target, camera_up, width, height, focal)
+        if base is None or other is None:
+            return None
+        radius = int(max(2.0, min(22.0, math.hypot(other[0] - base[0], other[1] - base[1]))))
+        return radius
+
+    def _to_world_frame(
+        self,
+        rot: np.ndarray,
+        local_point: Tuple[float, float, float],
+        base_z: float,
+    ) -> Tuple[float, float, float]:
+        rotated = rot @ np.array([local_point[0], local_point[1], 0.0], dtype=float)
+        return (self.state.x + rotated[0], self.state.y + rotated[1], base_z + local_point[2])
+
     def _render_minimap(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
         w, h = size
         pad = 18
-        panel = np.zeros((h, w, 3), dtype=np.uint8)
-        panel[:] = (18, 16, 14)
-        cv2.rectangle(panel, (0, 0), (w - 1, h - 1), (70, 64, 58), 1)
-
-        xs = np.linspace(-self._bounds, self._bounds, 48)
-        ys = np.linspace(-self._bounds, self._bounds, 48)
-        hmin = min(self.terrain.height(x, y) for x in xs for y in ys)
-        hmax = max(self.terrain.height(x, y) for x in xs for y in ys)
-        span = max(hmax - hmin, 1e-6)
+        panel = self._get_minimap_base(size)
 
         def to_px(x: float, y: float) -> Tuple[int, int]:
             px = int(pad + ((x + self._bounds) / (2 * self._bounds)) * (w - 2 * pad))
             py = int(h - pad - ((y + self._bounds) / (2 * self._bounds)) * (h - 2 * pad))
             return px, py
 
-        for gx in np.linspace(-self._bounds, self._bounds, 11):
-            prev = None
-            for gy in np.linspace(-self._bounds, self._bounds, 80):
-                z = self.terrain.height(gx, gy)
-                shade = int(_clamp(55 + ((z - hmin) / span) * 125, 40, 200))
-                point = to_px(gx, gy)
-                if prev is not None:
-                    cv2.line(panel, prev, point, (shade, shade, shade), 1, cv2.LINE_AA)
-                prev = point
-
-        for gy in np.linspace(-self._bounds, self._bounds, 11):
-            prev = None
-            for gx in np.linspace(-self._bounds, self._bounds, 80):
-                z = self.terrain.height(gx, gy)
-                shade = int(_clamp(65 + ((z - hmin) / span) * 115, 45, 190))
-                point = to_px(gx, gy)
-                if prev is not None:
-                    cv2.line(panel, prev, point, (shade, shade, shade), 1, cv2.LINE_AA)
-                prev = point
-
         for idx in range(1, len(self.trail)):
-            cv2.line(panel, to_px(self.trail[idx - 1][0], self.trail[idx - 1][1]), to_px(self.trail[idx][0], self.trail[idx][1]), (0, 150, 255), 2, cv2.LINE_AA)
+            start = to_px(self.trail[idx - 1][0], self.trail[idx - 1][1])
+            end = to_px(self.trail[idx][0], self.trail[idx][1])
+            cv2.line(panel, start, end, (0, 150, 255), 2, cv2.LINE_AA)
 
         for idx, waypoint in enumerate(self.waypoints):
             px, py = to_px(waypoint.x, waypoint.y)
             colour = (0, 255, 180) if idx == self.target_idx else (0, 220, 255)
             cv2.circle(panel, (px, py), 5, colour, -1, cv2.LINE_AA)
+            cv2.circle(panel, (px, py), 8 if idx == self.target_idx else 7, colour, 1, cv2.LINE_AA)
             cv2.putText(panel, waypoint.name, (px + 8, py - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.38, colour, 1, cv2.LINE_AA)
 
         rx, ry = to_px(self.state.x, self.state.y)
@@ -505,9 +531,7 @@ class Rover3DSim:
 
     def _render_history_panel(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
         w, h = size
-        panel = np.zeros((h, w, 3), dtype=np.uint8)
-        panel[:] = (14, 18, 18)
-        cv2.rectangle(panel, (0, 0), (w - 1, h - 1), (70, 64, 58), 1)
+        panel = self._get_history_base(size)
 
         history = max(1, len(self.history_speed))
         speed_series = self.history_speed[-history:]
@@ -546,17 +570,172 @@ class Rover3DSim:
         z = self.terrain.height(x, y) + dz
         return x, y, z
 
-    def render(self, resolution: Tuple[int, int] = (1280, 720)) -> np.ndarray:
+    def _build_background(self, resolution: Tuple[int, int]) -> np.ndarray:
         width, height = resolution
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
 
-        # Sky and ground gradient.
+        sky_top = np.array([110, 156, 214], dtype=np.float32)
+        sky_bottom = np.array([44, 36, 30], dtype=np.float32)
+        glow = np.array([22, 18, 8], dtype=np.float32)
+        center_x = width * 0.48
+        center_y = height * 0.56
+
         for row in range(height):
             t = row / max(height - 1, 1)
-            sky = np.array([98, 146, 205], dtype=np.float32)
-            haze = np.array([44, 34, 28], dtype=np.float32)
-            colour = sky * (1.0 - t) + haze * t
+            colour = sky_top * (1.0 - t) + sky_bottom * t
+            if t > 0.48:
+                colour = colour + glow * math.exp(-((t - 0.64) ** 2) * 18.0)
             canvas[row, :] = np.clip(colour, 0, 255).astype(np.uint8)
+
+        yy, xx = np.ogrid[:height, :width]
+        dx = (xx - center_x) / max(width, 1)
+        dy = (yy - center_y) / max(height, 1)
+        vignette = np.clip(1.0 - 0.28 * (dx * dx + dy * dy), 0.78, 1.0)
+        canvas[:] = np.clip(canvas.astype(np.float32) * vignette[..., None], 0, 255).astype(np.uint8)
+
+        return canvas
+
+    def _get_background(self, resolution: Tuple[int, int]) -> np.ndarray:
+        key = (int(resolution[0]), int(resolution[1]))
+        if key not in self._background_cache:
+            self._background_cache[key] = self._build_background(key)
+        return self._background_cache[key].copy()
+
+    def _get_terrain_segments(self) -> List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[int, int, int]]]:
+        key = (self.terrain_mode, self._bounds)
+        if key in self._terrain_cache:
+            return self._terrain_cache[key]
+
+        segments: List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[int, int, int]]] = []
+        grid = np.linspace(-self._bounds, self._bounds, 13)
+        samples = np.linspace(-self._bounds, self._bounds, 64)
+
+        for x in grid:
+            prev = None
+            for y in samples:
+                point = (float(x), float(y), self.terrain.height(float(x), float(y)))
+                if prev is not None:
+                    height_sample = (prev[2] + point[2]) * 0.5
+                    shade = int(_clamp(120 + height_sample * 26 - 6 * abs(float(x)), 55, 185))
+                    segments.append((prev, point, (shade, shade, shade)))
+                prev = point
+
+        for y in grid:
+            prev = None
+            for x in samples:
+                point = (float(x), float(y), self.terrain.height(float(x), float(y)))
+                if prev is not None:
+                    height_sample = (prev[2] + point[2]) * 0.5
+                    shade = int(_clamp(135 + height_sample * 22 - 5 * abs(float(y)), 65, 190))
+                    segments.append((prev, point, (shade, shade, shade)))
+                prev = point
+
+        self._terrain_cache[key] = segments
+        return segments
+
+    def _get_terrain_faces(self) -> List[Tuple[Tuple[Tuple[float, float, float], ...], Tuple[int, int, int]]]:
+        key = (self.terrain_mode, self._bounds)
+        if key in self._terrain_fill_cache:
+            return self._terrain_fill_cache[key]
+
+        faces: List[Tuple[Tuple[Tuple[float, float, float], ...], Tuple[int, int, int]]] = []
+        grid = np.linspace(-self._bounds, self._bounds, 18)
+
+        for ix in range(len(grid) - 1):
+            x0 = float(grid[ix])
+            x1 = float(grid[ix + 1])
+            for iy in range(len(grid) - 1):
+                y0 = float(grid[iy])
+                y1 = float(grid[iy + 1])
+                p00 = (x0, y0, self.terrain.height(x0, y0))
+                p10 = (x1, y0, self.terrain.height(x1, y0))
+                p11 = (x1, y1, self.terrain.height(x1, y1))
+                p01 = (x0, y1, self.terrain.height(x0, y1))
+                avg_height = (p00[2] + p10[2] + p11[2] + p01[2]) * 0.25
+                slope_x, slope_y = self.terrain.gradient((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+                slope_mag = min(1.8, math.hypot(slope_x, slope_y))
+                warm = np.array([92, 76, 54], dtype=float)
+                cool = np.array([62, 102, 88], dtype=float)
+                blend = _clamp((avg_height + 0.8) / 1.8, 0.0, 1.0)
+                base = warm * (1.0 - blend) + cool * blend
+                shade = _clamp(1.0 - 0.24 * slope_mag - 0.12 * max(0.0, avg_height), 0.52, 1.0)
+                colour = (
+                    int(_clamp(base[0] * shade, 0, 255)),
+                    int(_clamp(base[1] * shade, 0, 255)),
+                    int(_clamp(base[2] * shade, 0, 255)),
+                )
+                faces.append(((p00, p10, p11, p01), colour))
+
+        self._terrain_fill_cache[key] = faces
+        return faces
+
+    def _get_minimap_base(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
+        key = (int(size[0]), int(size[1]))
+        if key in self._minimap_base_cache:
+            return self._minimap_base_cache[key].copy()
+
+        w, h = key
+        pad = 18
+        panel = np.zeros((h, w, 3), dtype=np.uint8)
+        panel[:] = (18, 16, 14)
+        cv2.rectangle(panel, (0, 0), (w - 1, h - 1), (78, 70, 62), 1)
+        cv2.putText(panel, "MINIMAP", (14, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 1, cv2.LINE_AA)
+
+        xs = np.linspace(-self._bounds, self._bounds, 48)
+        ys = np.linspace(-self._bounds, self._bounds, 48)
+        hmin = min(self.terrain.height(float(x), float(y)) for x in xs for y in ys)
+        hmax = max(self.terrain.height(float(x), float(y)) for x in xs for y in ys)
+        span = max(hmax - hmin, 1e-6)
+
+        def to_px(x: float, y: float) -> Tuple[int, int]:
+            px = int(pad + (x + self._bounds) / (2 * self._bounds) * (w - 2 * pad))
+            py = int(h - pad - (y + self._bounds) / (2 * self._bounds) * (h - 2 * pad))
+            return px, py
+
+        for x in xs:
+            prev = None
+            for y in ys:
+                z = self.terrain.height(float(x), float(y))
+                shade = int(_clamp(62 + ((z - hmin) / span) * 110, 42, 188))
+                point = to_px(float(x), float(y))
+                if prev is not None:
+                    cv2.line(panel, prev, point, (shade, shade, shade), 1, cv2.LINE_AA)
+                prev = point
+
+        for y in ys:
+            prev = None
+            for x in xs:
+                z = self.terrain.height(float(x), float(y))
+                shade = int(_clamp(62 + ((z - hmin) / span) * 110, 42, 188))
+                point = to_px(float(x), float(y))
+                if prev is not None:
+                    cv2.line(panel, prev, point, (shade, shade, shade), 1, cv2.LINE_AA)
+                prev = point
+
+        cv2.rectangle(panel, (pad - 2, pad - 2), (w - pad + 2, h - pad + 2), (90, 80, 70), 1)
+        self._minimap_base_cache[key] = panel
+        return panel.copy()
+
+    def _get_history_base(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
+        key = (int(size[0]), int(size[1]))
+        if key in self._history_base_cache:
+            return self._history_base_cache[key].copy()
+
+        w, h = key
+        panel = np.zeros((h, w, 3), dtype=np.uint8)
+        panel[:] = (14, 18, 18)
+        cv2.rectangle(panel, (0, 0), (w - 1, h - 1), (78, 70, 62), 1)
+        cv2.putText(panel, "HISTORY", (14, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 1, cv2.LINE_AA)
+        cv2.line(panel, (20, h // 2), (w - 20, h // 2), (75, 75, 75), 1, cv2.LINE_AA)
+        cv2.line(panel, (20, 42), (20, h - 28), (68, 68, 68), 1, cv2.LINE_AA)
+        for y in [64, 120, 176, 232]:
+            cv2.line(panel, (22, y), (w - 22, y), (32, 38, 38), 1, cv2.LINE_AA)
+        self._history_base_cache[key] = panel
+        return panel.copy()
+
+    def render(self, resolution: Tuple[int, int] = (1280, 720)) -> np.ndarray:
+        width, height = resolution
+        canvas = self._get_background((width, height))
 
         cam_heading = math.radians(self.state.heading_deg)
         camera_pos = np.array(
@@ -571,25 +750,21 @@ class Rover3DSim:
         camera_up = np.array([0.0, 0.0, 1.0], dtype=float)
         focal = 900.0
 
-        grid = np.linspace(-self._bounds, self._bounds, 13)
-        for x in grid:
-            prev = None
-            for y in np.linspace(-self._bounds, self._bounds, 64):
-                point = (x, y, self.terrain.height(x, y))
-                if prev is not None:
-                    height_sample = (prev[2] + point[2]) * 0.5
-                    shade = int(_clamp(120 + height_sample * 26 - 6 * abs(x), 55, 185))
-                    self._draw_line_3d(canvas, prev, point, (shade, shade, shade), 1, camera_pos, camera_target, camera_up, focal)
-                prev = point
-        for y in grid:
-            prev = None
-            for x in np.linspace(-self._bounds, self._bounds, 64):
-                point = (x, y, self.terrain.height(x, y))
-                if prev is not None:
-                    height_sample = (prev[2] + point[2]) * 0.5
-                    shade = int(_clamp(135 + height_sample * 22 - 5 * abs(y), 65, 190))
-                    self._draw_line_3d(canvas, prev, point, (shade, shade, shade), 1, camera_pos, camera_target, camera_up, focal)
-                prev = point
+        for face, colour in self._get_terrain_faces():
+            projected: List[Tuple[int, int]] = []
+            visible = True
+            for point in face:
+                projected_point = self._project(point, camera_pos, camera_target, camera_up, width, height, focal)
+                if projected_point is None:
+                    visible = False
+                    break
+                projected.append((projected_point[0], projected_point[1]))
+            if visible and len(projected) == 4:
+                cv2.fillConvexPoly(canvas, np.array(projected, dtype=np.int32), colour)
+
+        for prev, point, colour in self._get_terrain_segments():
+            muted = (int(colour[0] * 0.78), int(colour[1] * 0.78), int(colour[2] * 0.78))
+            self._draw_line_3d(canvas, prev, point, muted, 1, camera_pos, camera_target, camera_up, focal)
 
         for idx, waypoint in enumerate(self.waypoints):
             base = (waypoint.x, waypoint.y, self.terrain.height(waypoint.x, waypoint.y))
@@ -617,9 +792,10 @@ class Rover3DSim:
                 focal,
             )
 
-        body_length = 1.5
-        body_width = 1.0
-        body_height = 0.45
+        body_length = 1.9
+        body_width = 1.15
+        body_height = 0.42
+        cabin_height = 0.7
         body_z = self.state.z + 0.18
         body_points = [
             (-body_length / 2, -body_width / 2, 0.0),
@@ -632,10 +808,130 @@ class Rover3DSim:
             (-body_length / 2, body_width / 2, body_height),
         ]
         rot = _rotation_matrix(self.state.heading_deg)
-        body_world = []
-        for px, py, pz in body_points:
-            rotated = rot @ np.array([px, py, 0.0], dtype=float)
-            body_world.append((self.state.x + rotated[0], self.state.y + rotated[1], body_z + pz))
+        body_world = [self._to_world_frame(rot, point, body_z) for point in body_points]
+
+        cabin_points = [
+            (-0.35, -0.34, body_height),
+            (0.62, -0.34, body_height),
+            (0.62, 0.34, body_height),
+            (-0.35, 0.34, body_height),
+            (-0.24, -0.28, cabin_height),
+            (0.44, -0.28, cabin_height),
+            (0.44, 0.28, cabin_height),
+            (-0.24, 0.28, cabin_height),
+        ]
+        cabin_world = [self._to_world_frame(rot, point, body_z) for point in cabin_points]
+
+        hood_points = [
+            (0.48, -0.34, body_height * 0.88),
+            (1.0, -0.28, body_height * 0.8),
+            (1.0, 0.28, body_height * 0.8),
+            (0.48, 0.34, body_height * 0.88),
+        ]
+        hood_world = [self._to_world_frame(rot, point, body_z) for point in hood_points]
+
+        roof_points = [
+            (-0.2, -0.26, cabin_height),
+            (0.46, -0.26, cabin_height),
+            (0.46, 0.26, cabin_height),
+            (-0.2, 0.26, cabin_height),
+        ]
+        roof_world = [self._to_world_frame(rot, point, body_z) for point in roof_points]
+
+        self._fill_polygon_3d(canvas, body_world[:4], (46, 46, 50), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, body_world[4:], (68, 70, 74), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, cabin_world[:4], (88, 100, 112), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, cabin_world[4:], (112, 136, 154), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, hood_world, (76, 82, 90), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, roof_world, (126, 146, 160), camera_pos, camera_target, camera_up, focal)
+
+        chamber_points = [
+            (-0.68, -0.22, body_height + 0.06),
+            (-0.05, -0.22, body_height + 0.06),
+            (-0.05, 0.22, body_height + 0.06),
+            (-0.68, 0.22, body_height + 0.06),
+            (-0.62, -0.16, body_height + 0.42),
+            (0.02, -0.16, body_height + 0.42),
+            (0.02, 0.16, body_height + 0.42),
+            (-0.62, 0.16, body_height + 0.42),
+        ]
+        chamber_world = [self._to_world_frame(rot, point, body_z) for point in chamber_points]
+        self._fill_polygon_3d(canvas, chamber_world[:4], (54, 58, 66), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, chamber_world[4:], (86, 146, 166), camera_pos, camera_target, camera_up, focal)
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]:
+            self._draw_line_3d(canvas, chamber_world[a], chamber_world[b], (170, 212, 220), 1, camera_pos, camera_target, camera_up, focal)
+
+        chamber_window = [
+            (-0.52, -0.12, body_height + 0.22),
+            (-0.16, -0.12, body_height + 0.22),
+            (-0.16, 0.12, body_height + 0.22),
+            (-0.52, 0.12, body_height + 0.22),
+        ]
+        self._fill_polygon_3d(canvas, [self._to_world_frame(rot, point, body_z) for point in chamber_window], (130, 210, 230), camera_pos, camera_target, camera_up, focal)
+
+        scoop_points = [
+            (0.84, -0.22, -0.18),
+            (1.22, -0.15, -0.28),
+            (1.34, 0.00, -0.42),
+            (1.22, 0.15, -0.28),
+            (0.84, 0.22, -0.18),
+            (0.92, 0.00, -0.10),
+        ]
+        scoop_world = [self._to_world_frame(rot, point, body_z) for point in scoop_points]
+        self._fill_polygon_3d(canvas, scoop_world, (120, 98, 58), camera_pos, camera_target, camera_up, focal)
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 0)]:
+            self._draw_line_3d(canvas, scoop_world[a], scoop_world[b], (202, 176, 96), 2, camera_pos, camera_target, camera_up, focal)
+
+        drill_base = self._to_world_frame(rot, (1.02, 0.0, 0.32), body_z)
+        drill_tip = self._to_world_frame(rot, (1.18, 0.0, -0.56), body_z)
+        self._draw_line_3d(canvas, drill_base, drill_tip, (238, 210, 84), 4, camera_pos, camera_target, camera_up, focal)
+        for offset_y in [-0.08, 0.0, 0.08]:
+            auger_start = self._to_world_frame(rot, (0.98, offset_y, 0.18), body_z)
+            auger_end = self._to_world_frame(rot, (1.15, offset_y * 0.2, -0.46), body_z)
+            self._draw_line_3d(canvas, auger_start, auger_end, (255, 180, 0), 1, camera_pos, camera_target, camera_up, focal)
+        drill_bit = self._project(drill_tip, camera_pos, camera_target, camera_up, width, height, focal)
+        if drill_bit is not None:
+            cv2.circle(canvas, (drill_bit[0], drill_bit[1]), 5, (255, 180, 0), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (drill_bit[0], drill_bit[1]), 10, (255, 220, 120), 1, cv2.LINE_AA)
+
+        sample_chute = [
+            (0.74, -0.10, 0.22),
+            (0.74, 0.10, 0.22),
+            (1.00, 0.10, -0.10),
+            (1.00, -0.10, -0.10),
+        ]
+        self._fill_polygon_3d(canvas, [self._to_world_frame(rot, point, body_z) for point in sample_chute], (102, 88, 52), camera_pos, camera_target, camera_up, focal)
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)]:
+            self._draw_line_3d(canvas, self._to_world_frame(rot, sample_chute[a], body_z), self._to_world_frame(rot, sample_chute[b], body_z), (175, 148, 72), 2, camera_pos, camera_target, camera_up, focal)
+
+        intake_beam_start = self._to_world_frame(rot, (0.96, 0.0, 0.10), body_z)
+        intake_beam_end = self._to_world_frame(rot, (-0.18, 0.0, 0.34), body_z)
+        self._draw_line_3d(canvas, intake_beam_start, intake_beam_end, (255, 214, 76), 2, camera_pos, camera_target, camera_up, focal)
+
+        wheel_offsets = [
+            (-0.78, -0.56, -0.16),
+            (-0.78, 0.56, -0.16),
+            (0.78, -0.56, -0.16),
+            (0.78, 0.56, -0.16),
+        ]
+        wheel_shadow_offset = (0.16, -0.08, 0.0)
+        wheel_span = 0.29
+        for wx, wy, wz in wheel_offsets:
+            offset = rot @ np.array([wx, wy, 0.0], dtype=float)
+            wheel_center = (self.state.x + offset[0], self.state.y + offset[1], body_z + wz)
+            radius = self._projected_radius(wheel_center, (wheel_span, 0.0, 0.0), camera_pos, camera_target, camera_up, focal, width, height)
+            projected_point = self._project(wheel_center, camera_pos, camera_target, camera_up, width, height, focal)
+            if projected_point is None or radius is None:
+                continue
+            projected_x, projected_y = projected_point[0], projected_point[1]
+            cv2.circle(canvas, (projected_x + 2, projected_y + 4), radius + 2, (16, 16, 16), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (projected_x, projected_y), radius, (26, 26, 28), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (projected_x, projected_y), max(1, radius // 2), (68, 68, 72), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (projected_x, projected_y), max(1, radius // 3), (126, 126, 130), 1, cv2.LINE_AA)
+
+            wheel_shadow = self._project((wheel_center[0] + wheel_shadow_offset[0], wheel_center[1] + wheel_shadow_offset[1], wheel_center[2] - 0.03), camera_pos, camera_target, camera_up, width, height, focal)
+            if wheel_shadow is not None:
+                cv2.circle(canvas, (wheel_shadow[0], wheel_shadow[1] + 5), max(4, radius + 2), (10, 10, 10), -1, cv2.LINE_AA)
 
         edges = [
             (0, 1), (1, 2), (2, 3), (3, 0),
@@ -643,20 +939,44 @@ class Rover3DSim:
             (0, 4), (1, 5), (2, 6), (3, 7),
         ]
         for a, b in edges:
-            self._draw_line_3d(canvas, body_world[a], body_world[b], (40, 40, 40), 3, camera_pos, camera_target, camera_up, focal)
+            self._draw_line_3d(canvas, body_world[a], body_world[b], (28, 28, 32), 2, camera_pos, camera_target, camera_up, focal)
+
+        cabin_edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+        for a, b in cabin_edges:
+            self._draw_line_3d(canvas, cabin_world[a], cabin_world[b], (40, 48, 54), 2, camera_pos, camera_target, camera_up, focal)
+
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 0)]:
+            self._draw_line_3d(canvas, hood_world[a], hood_world[b], (48, 56, 62), 2, camera_pos, camera_target, camera_up, focal)
+            self._draw_line_3d(canvas, roof_world[a], roof_world[b], (150, 170, 180), 1, camera_pos, camera_target, camera_up, focal)
 
         # Simple shadow and a front marker so the rover reads more clearly.
         shadow_center = (self.state.x + 0.18, self.state.y - 0.12, self.state.z + 0.01)
         shadow = self._project(shadow_center, camera_pos, camera_target, camera_up, width, height, focal)
         if shadow is not None:
-            cv2.ellipse(canvas, (shadow[0], shadow[1] + 6), (28, 14), 0, 0, 360, (16, 16, 16), -1, cv2.LINE_AA)
+            cv2.ellipse(canvas, (shadow[0], shadow[1] + 8), (34, 16), 0, 0, 360, (12, 12, 12), -1, cv2.LINE_AA)
+
+        headlight = self._project(self._world_point(1.05, 0.0, 0.28), camera_pos, camera_target, camera_up, width, height, focal)
+        if headlight is not None:
+            cv2.circle(canvas, (headlight[0], headlight[1]), 4, (255, 245, 210), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (headlight[0], headlight[1]), 8, (255, 220, 120), 1, cv2.LINE_AA)
+
+        sensor_mast_base = (self.state.x - 0.1, self.state.y + 0.02, self.state.z + 0.35)
+        sensor_mast_tip = (self.state.x - 0.12, self.state.y + 0.02, self.state.z + 1.0)
+        self._draw_line_3d(canvas, sensor_mast_base, sensor_mast_tip, (235, 235, 235), 2, camera_pos, camera_target, camera_up, focal)
+        sensor_tip = self._project((sensor_mast_tip[0], sensor_mast_tip[1], sensor_mast_tip[2] + 0.04), camera_pos, camera_target, camera_up, width, height, focal)
+        if sensor_tip is not None:
+            cv2.circle(canvas, (sensor_tip[0], sensor_tip[1]), 3, (0, 255, 220), -1, cv2.LINE_AA)
 
         self._draw_line_3d(
             canvas,
             (self.state.x, self.state.y, self.state.z + 0.2),
             self._world_point(1.8, 0.0, 0.2),
-            (0, 0, 255),
-            4,
+            (0, 0, 210),
+            3,
             camera_pos,
             camera_target,
             camera_up,
@@ -666,7 +986,7 @@ class Rover3DSim:
             canvas,
             (self.state.x, self.state.y, self.state.z + 0.18),
             (self.state.x, self.state.y, self.state.z + 1.3),
-            (255, 255, 255),
+            (245, 245, 245),
             2,
             camera_pos,
             camera_target,
@@ -684,6 +1004,7 @@ class Rover3DSim:
 
         minimap = self._render_minimap()
         history_panel = self._render_history_panel()
+
         canvas[14:304, width - 304:width - 14] = minimap
         canvas[320:610, width - 304:width - 14] = history_panel
 
@@ -696,8 +1017,9 @@ class Rover3DSim:
         ]
         for idx, line in enumerate(hud_lines):
             y = 28 + idx * 24
-            cv2.rectangle(canvas, (14, y - 18), (14 + 540, y + 4), (18, 18, 18), -1)
-            cv2.putText(canvas, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.rectangle(canvas, (14, y - 18), (14 + 560, y + 4), (16, 16, 16), -1)
+            cv2.rectangle(canvas, (14, y - 18), (14 + 560, y + 4), (56, 48, 40), 1)
+            cv2.putText(canvas, line, (18, y), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (248, 248, 248), 1, cv2.LINE_AA)
 
         help_lines = [
             "W/S throttle  A/D steer  M toggle manual  Space pause  R reset  X zero input  1 auto  Q quit",
@@ -706,7 +1028,10 @@ class Rover3DSim:
         for idx, line in enumerate(help_lines):
             cv2.putText(canvas, line, (18, height - 72 + idx * 20), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (240, 240, 240), 1, cv2.LINE_AA)
 
-        cv2.putText(canvas, "DIRT Rover 3D Simulation", (18, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 220), 2, cv2.LINE_AA)
+        cv2.rectangle(canvas, (14, height - 98), (width - 320, height - 8), (12, 12, 12), -1)
+        cv2.rectangle(canvas, (14, height - 98), (width - 320, height - 8), (62, 56, 48), 1)
+        cv2.putText(canvas, "DIRT Rover 3D Simulation", (18, height - 64), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (0, 255, 220), 2, cv2.LINE_AA)
+        cv2.putText(canvas, "drill  scoop  spectrometer payload  smooth chase cam", (18, height - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 230, 230), 1, cv2.LINE_AA)
         return canvas
 
     def save_path_csv(self, path: str = "sim_rover_3d_path.csv") -> None:
