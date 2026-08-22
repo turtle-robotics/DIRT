@@ -96,6 +96,25 @@ def _run_navigation_test():
     nav.run_demo(ticks=120)
 
 
+def _run_mission_from_csv(path: str):
+    """Run a waypoint mission from a CSV list of field targets."""
+    from navigation.navigator import Navigator
+
+    if not path:
+        raise ValueError("A mission CSV path is required")
+
+    nav = Navigator.from_csv(path)
+    log.info("=== Mission start: %d waypoints from %s ===", len(nav.waypoints), path)
+    results = nav.run_mission(ticks=120, tick_delay=0.2)
+    if results:
+        print("\nMission results:")
+        for item in results:
+            print(f"  - {item['waypoint']}: {item['status']} ({item['distance_m']} m)")
+        log.info("Mission completed with %d waypoint(s)", len(results))
+    else:
+        log.warning("No waypoints reached during this mission")
+
+
 def _run_rover_3d_test():
     """Full 3D rover motion demo over terrain."""
     from simulation.rover_3d_sim import run_rover_3d_demo
@@ -227,6 +246,12 @@ if __name__ == "__main__":
         help="Path to waypoints CSV (name,lat,lon)",
     )
     parser.add_argument(
+        "--mission",
+        type=str,
+        default=None,
+        help="Run a farm mission from a waypoint CSV with columns: name,lat,lon,action,tolerance_m",
+    )
+    parser.add_argument(
         "--sweep",
         action="store_true",
         help="Run alignment simulation parameter sweep",
@@ -246,5 +271,7 @@ if __name__ == "__main__":
     elif args.sweep:
         from simulation.alignment_sim import run_parameter_sweep
         run_parameter_sweep()
+    elif args.mission:
+        _run_mission_from_csv(args.mission)
     else:
         _run_full_mission(args.waypoints)

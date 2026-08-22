@@ -16,6 +16,7 @@ import csv
 import logging
 import math
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
@@ -43,6 +44,10 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 def _wrap_angle_deg(angle: float) -> float:
     return (angle + 180.0) % 360.0 - 180.0
+
+
+def _lerp(value: float, target: float, alpha: float) -> float:
+    return value + (target - value) * _clamp(alpha, 0.0, 1.0)
 
 
 def _rotation_matrix(yaw_deg: float) -> np.ndarray:
@@ -223,7 +228,14 @@ class Rover3DSim:
         self._terrain_cache: dict[Tuple[str, float], List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[int, int, int]]]] = {}
         self._minimap_base_cache: dict[Tuple[int, int], np.ndarray] = {}
         self._history_base_cache: dict[Tuple[int, int], np.ndarray] = {}
+        self._camera_pos = np.zeros(3, dtype=float)
+        self._camera_target = np.zeros(3, dtype=float)
+        self._render_frame = 0
+        self._wheel_rotation = 0.0
+        self._dust_particles: List[Tuple[float, float, float, float, float]] = []
         self.state.z = self.terrain.height(self.state.x, self.state.y)
+        self._camera_pos = np.array([self.state.x - 5.5, self.state.y - 5.5, self.state.z + 3.8], dtype=float)
+        self._camera_target = np.array([self.state.x + 2.0, self.state.y + 1.0, self.state.z + 0.2], dtype=float)
 
     def _default_waypoints(self) -> List[Waypoint3D]:
         return [
@@ -281,6 +293,8 @@ class Rover3DSim:
         self.history_speed.clear()
         self.history_pitch.clear()
         self.history_roll.clear()
+        self._dust_particles.clear()
+        self._wheel_rotation = 0.0
         self.manual_throttle = 0.0
         self.manual_steer = 0.0
 
@@ -316,6 +330,18 @@ class Rover3DSim:
             self.manual_mode = False
         return False
 
+    def _spawn_dust(self) -> None:
+        if abs(self.state.speed) < 0.08:
+            return
+        heading_rad = math.radians(self.state.heading_deg)
+        trail_x = self.state.x - math.cos(heading_rad) * 0.7
+        trail_y = self.state.y - math.sin(heading_rad) * 0.7
+        for _ in range(1 + int(abs(self.state.speed) * 2.5)):
+            offset = np.array([np.random.normal(0.0, 0.22), np.random.normal(0.0, 0.22), 0.0])
+            self._dust_particles.append((trail_x + offset[0], trail_y + offset[1], self.state.z + 0.04, 0.08 + np.random.random() * 0.18, 0.35 + np.random.random() * 0.65))
+        if len(self._dust_particles) > 220:
+            self._dust_particles = self._dust_particles[-220:]
+
     def _step_manual(self, dt: float) -> None:
         steer_rate = 85.0 * self.manual_steer
         self.state.heading_deg = _wrap_angle_deg(self.state.heading_deg + steer_rate * dt)
@@ -333,10 +359,12 @@ class Rover3DSim:
         self._limit_to_world()
         self.state.z = self.terrain.height(self.state.x, self.state.y)
         self._update_body_orientation()
+        self._wheel_rotation += self.state.speed * dt * 4.4
         self.trail.append((self.state.x, self.state.y, self.state.z))
         self.history_speed.append(self.state.speed)
         self.history_pitch.append(self.state.pitch_deg)
         self.history_roll.append(self.state.roll_deg)
+        self._spawn_dust()
 
     def _step_autonomous(self, dt: float) -> bool:
         target = self.current_waypoint()
@@ -369,10 +397,12 @@ class Rover3DSim:
         self._limit_to_world()
         self.state.z = self.terrain.height(self.state.x, self.state.y)
         self._update_body_orientation()
+        self._wheel_rotation += self.state.speed * dt * 4.4
         self.trail.append((self.state.x, self.state.y, self.state.z))
         self.history_speed.append(self.state.speed)
         self.history_pitch.append(self.state.pitch_deg)
         self.history_roll.append(self.state.roll_deg)
+        self._spawn_dust()
 
         if distance <= self.waypoint_tolerance_m:
             log.info("Reached waypoint %s", target.name)
@@ -639,7 +669,7 @@ class Rover3DSim:
             return self._terrain_fill_cache[key]
 
         faces: List[Tuple[Tuple[Tuple[float, float, float], ...], Tuple[int, int, int]]] = []
-        grid = np.linspace(-self._bounds, self._bounds, 18)
+        grid = np.linspace(-self._bounds, self._bounds, 12)
 
         for ix in range(len(grid) - 1):
             x0 = float(grid[ix])
@@ -733,22 +763,70 @@ class Rover3DSim:
         self._history_base_cache[key] = panel
         return panel.copy()
 
-    def render(self, resolution: Tuple[int, int] = (1280, 720)) -> np.ndarray:
+    def _render_dust(self, canvas: np.ndarray, camera_pos: np.ndarray, camera_target: np.ndarray, camera_up: np.ndarray, focal: float, width: int, height: int) -> None:
+        for x, y, z, radius, alpha in self._dust_particles:
+            dust_point = (x, y, z)
+            p = self._project(dust_point, camera_pos, camera_target, camera_up, width, height, focal)
+            if p is None:
+                continue
+            px, py = p[0], p[1]
+            intensity = int(_clamp(alpha * 255.0, 20, 180))
+            cv2.circle(canvas, (px, py), max(2, int(radius * 8)), (intensity, intensity, intensity), -1, cv2.LINE_AA)
+
+    def render(self, resolution: Tuple[int, int] = (2560, 1440)) -> np.ndarray:
         width, height = resolution
+        target_pixels = 900_000
+        render_scale = 1.0
+        if width * height > target_pixels:
+            render_scale = math.sqrt(target_pixels / (width * height))
+            width = max(320, int(width * render_scale))
+            height = max(180, int(height * render_scale))
         canvas = self._get_background((width, height))
 
         cam_heading = math.radians(self.state.heading_deg)
-        camera_pos = np.array(
+        desired_distance = 5.2 + min(2.0, max(0.0, self.state.speed * 0.75))
+        desired_eye = np.array(
             [
-                self.state.x - math.cos(cam_heading) * 5.5,
-                self.state.y - math.sin(cam_heading) * 5.5,
-                self.state.z + 3.8,
+                self.state.x - math.cos(cam_heading) * desired_distance,
+                self.state.y - math.sin(cam_heading) * desired_distance,
+                self.state.z + 3.2 + min(1.4, max(0.0, self.state.speed * 0.2)),
             ],
             dtype=float,
         )
-        camera_target = np.array([self.state.x + 2.0, self.state.y + 1.0, self.state.z + 0.2], dtype=float)
-        camera_up = np.array([0.0, 0.0, 1.0], dtype=float)
-        focal = 900.0
+        desired_target = np.array(
+            [
+                self.state.x + math.cos(cam_heading) * 1.8,
+                self.state.y + math.sin(cam_heading) * 1.8,
+                self.state.z + 0.25 + 0.10 * math.sin(math.radians(self.state.pitch_deg)),
+            ],
+            dtype=float,
+        )
+
+        smooth_alpha = 0.18 if self._render_frame == 0 else 0.12
+        self._camera_pos = np.array(
+            [
+                _lerp(self._camera_pos[0], desired_eye[0], smooth_alpha),
+                _lerp(self._camera_pos[1], desired_eye[1], smooth_alpha),
+                _lerp(self._camera_pos[2], desired_eye[2], smooth_alpha),
+            ],
+            dtype=float,
+        )
+        self._camera_target = np.array(
+            [
+                _lerp(self._camera_target[0], desired_target[0], smooth_alpha),
+                _lerp(self._camera_target[1], desired_target[1], smooth_alpha),
+                _lerp(self._camera_target[2], desired_target[2], smooth_alpha),
+            ],
+            dtype=float,
+        )
+        self._render_frame += 1
+
+        roll_tilt = math.radians(self.state.roll_deg) * 0.35
+        camera_pos = self._camera_pos.copy()
+        camera_target = self._camera_target.copy()
+        camera_up = np.array([math.sin(roll_tilt) * 0.35, -math.sin(roll_tilt) * 0.18, 1.0], dtype=float)
+        camera_up /= np.linalg.norm(camera_up)
+        focal = 980.0 * render_scale
 
         for face, colour in self._get_terrain_faces():
             projected: List[Tuple[int, int]] = []
@@ -802,48 +880,74 @@ class Rover3DSim:
             (body_length / 2, -body_width / 2, 0.0),
             (body_length / 2, body_width / 2, 0.0),
             (-body_length / 2, body_width / 2, 0.0),
-            (-body_length / 2, -body_width / 2, body_height),
-            (body_length / 2, -body_width / 2, body_height),
-            (body_length / 2, body_width / 2, body_height),
-            (-body_length / 2, body_width / 2, body_height),
+            (-body_length / 2 + 0.22, -body_width / 2 + 0.08, body_height),
+            (body_length / 2 - 0.18, -body_width / 2 + 0.08, body_height),
+            (body_length / 2 - 0.18, body_width / 2 - 0.08, body_height),
+            (-body_length / 2 + 0.22, body_width / 2 - 0.08, body_height),
         ]
         rot = _rotation_matrix(self.state.heading_deg)
         body_world = [self._to_world_frame(rot, point, body_z) for point in body_points]
 
         cabin_points = [
-            (-0.35, -0.34, body_height),
-            (0.62, -0.34, body_height),
-            (0.62, 0.34, body_height),
-            (-0.35, 0.34, body_height),
-            (-0.24, -0.28, cabin_height),
-            (0.44, -0.28, cabin_height),
-            (0.44, 0.28, cabin_height),
-            (-0.24, 0.28, cabin_height),
+            (-0.42, -0.36, body_height + 0.02),
+            (0.62, -0.36, body_height + 0.02),
+            (0.62, 0.36, body_height + 0.02),
+            (-0.42, 0.36, body_height + 0.02),
+            (-0.28, -0.30, cabin_height),
+            (0.49, -0.30, cabin_height),
+            (0.49, 0.30, cabin_height),
+            (-0.28, 0.30, cabin_height),
         ]
         cabin_world = [self._to_world_frame(rot, point, body_z) for point in cabin_points]
 
         hood_points = [
-            (0.48, -0.34, body_height * 0.88),
-            (1.0, -0.28, body_height * 0.8),
-            (1.0, 0.28, body_height * 0.8),
-            (0.48, 0.34, body_height * 0.88),
+            (0.58, -0.34, body_height * 0.92),
+            (0.98, -0.28, body_height * 0.82),
+            (0.98, 0.28, body_height * 0.82),
+            (0.58, 0.34, body_height * 0.92),
         ]
         hood_world = [self._to_world_frame(rot, point, body_z) for point in hood_points]
 
         roof_points = [
-            (-0.2, -0.26, cabin_height),
-            (0.46, -0.26, cabin_height),
-            (0.46, 0.26, cabin_height),
-            (-0.2, 0.26, cabin_height),
+            (-0.12, -0.24, cabin_height + 0.06),
+            (0.42, -0.24, cabin_height + 0.06),
+            (0.42, 0.24, cabin_height + 0.06),
+            (-0.12, 0.24, cabin_height + 0.06),
         ]
         roof_world = [self._to_world_frame(rot, point, body_z) for point in roof_points]
 
-        self._fill_polygon_3d(canvas, body_world[:4], (46, 46, 50), camera_pos, camera_target, camera_up, focal)
-        self._fill_polygon_3d(canvas, body_world[4:], (68, 70, 74), camera_pos, camera_target, camera_up, focal)
-        self._fill_polygon_3d(canvas, cabin_world[:4], (88, 100, 112), camera_pos, camera_target, camera_up, focal)
-        self._fill_polygon_3d(canvas, cabin_world[4:], (112, 136, 154), camera_pos, camera_target, camera_up, focal)
-        self._fill_polygon_3d(canvas, hood_world, (76, 82, 90), camera_pos, camera_target, camera_up, focal)
-        self._fill_polygon_3d(canvas, roof_world, (126, 146, 160), camera_pos, camera_target, camera_up, focal)
+        front_bumper = [
+            (0.96, -0.38, 0.10),
+            (1.12, -0.28, 0.12),
+            (1.12, 0.28, 0.12),
+            (0.96, 0.38, 0.10),
+        ]
+        front_bumper_world = [self._to_world_frame(rot, point, body_z) for point in front_bumper]
+
+        rear_panel = [
+            (-1.02, -0.32, 0.12),
+            (-1.12, -0.26, 0.32),
+            (-1.12, 0.26, 0.32),
+            (-1.02, 0.32, 0.12),
+        ]
+        rear_panel_world = [self._to_world_frame(rot, point, body_z) for point in rear_panel]
+
+        self._fill_polygon_3d(canvas, body_world[:4], (44, 45, 48), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, body_world[4:], (64, 68, 72), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, rear_panel_world, (52, 56, 62), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, front_bumper_world, (76, 82, 88), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, cabin_world[:4], (92, 105, 116), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, cabin_world[4:], (118, 138, 154), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, hood_world, (82, 88, 94), camera_pos, camera_target, camera_up, focal)
+        self._fill_polygon_3d(canvas, roof_world, (128, 146, 160), camera_pos, camera_target, camera_up, focal)
+
+        highlight_poly = [
+            self._to_world_frame(rot, (-0.10, -0.18, body_height + 0.02), body_z),
+            self._to_world_frame(rot, (0.45, -0.18, body_height + 0.02), body_z),
+            self._to_world_frame(rot, (0.45, -0.03, cabin_height - 0.05), body_z),
+            self._to_world_frame(rot, (-0.10, -0.03, cabin_height - 0.05), body_z),
+        ]
+        self._fill_polygon_3d(canvas, highlight_poly, (156, 168, 180), camera_pos, camera_target, camera_up, focal)
 
         chamber_points = [
             (-0.68, -0.22, body_height + 0.06),
@@ -916,22 +1020,52 @@ class Rover3DSim:
         ]
         wheel_shadow_offset = (0.16, -0.08, 0.0)
         wheel_span = 0.29
-        for wx, wy, wz in wheel_offsets:
+        for wheel_idx, (wx, wy, wz) in enumerate(wheel_offsets):
             offset = rot @ np.array([wx, wy, 0.0], dtype=float)
-            wheel_center = (self.state.x + offset[0], self.state.y + offset[1], body_z + wz)
+            suspension_heave = 0.04 * abs(self.state.speed) / max(self.max_speed_mps, 0.1)
+            suspension_roll = 0.02 * abs(self.state.roll_deg) / 18.0
+            suspension_pitch = 0.02 * abs(self.state.pitch_deg) / 18.0
+            wheel_z = body_z + wz - suspension_heave - suspension_roll - suspension_pitch * ((1 if wheel_idx % 2 == 0 else -1))
+            wheel_center = (self.state.x + offset[0], self.state.y + offset[1], wheel_z)
             radius = self._projected_radius(wheel_center, (wheel_span, 0.0, 0.0), camera_pos, camera_target, camera_up, focal, width, height)
             projected_point = self._project(wheel_center, camera_pos, camera_target, camera_up, width, height, focal)
             if projected_point is None or radius is None:
                 continue
             projected_x, projected_y = projected_point[0], projected_point[1]
-            cv2.circle(canvas, (projected_x + 2, projected_y + 4), radius + 2, (16, 16, 16), -1, cv2.LINE_AA)
-            cv2.circle(canvas, (projected_x, projected_y), radius, (26, 26, 28), -1, cv2.LINE_AA)
-            cv2.circle(canvas, (projected_x, projected_y), max(1, radius // 2), (68, 68, 72), -1, cv2.LINE_AA)
-            cv2.circle(canvas, (projected_x, projected_y), max(1, radius // 3), (126, 126, 130), 1, cv2.LINE_AA)
 
             wheel_shadow = self._project((wheel_center[0] + wheel_shadow_offset[0], wheel_center[1] + wheel_shadow_offset[1], wheel_center[2] - 0.03), camera_pos, camera_target, camera_up, width, height, focal)
             if wheel_shadow is not None:
-                cv2.circle(canvas, (wheel_shadow[0], wheel_shadow[1] + 5), max(4, radius + 2), (10, 10, 10), -1, cv2.LINE_AA)
+                cv2.ellipse(
+                    canvas,
+                    (wheel_shadow[0], wheel_shadow[1] + 5),
+                    (max(8, radius + 6), max(4, radius // 2 + 3)),
+                    0,
+                    0,
+                    360,
+                    (12, 12, 12),
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+            tire_axes = (max(8, radius + 4), max(6, int(radius * 0.72)))
+            cv2.ellipse(canvas, (projected_x, projected_y), tire_axes, 0, 0, 360, (18, 18, 20), -1, cv2.LINE_AA)
+            cv2.ellipse(canvas, (projected_x, projected_y), tire_axes, 0, 0, 360, (92, 92, 96), 2, cv2.LINE_AA)
+            cv2.ellipse(canvas, (projected_x, projected_y), (max(5, radius - 2), max(4, int(radius * 0.56))), 0, 0, 360, (50, 52, 56), -1, cv2.LINE_AA)
+            cv2.ellipse(canvas, (projected_x, projected_y), (max(2, radius // 3), max(2, int(radius * 0.24))), 0, 0, 360, (132, 136, 140), -1, cv2.LINE_AA)
+
+            for spoke_idx in range(6):
+                spoke_angle = self._wheel_rotation * 0.7 + spoke_idx * (math.pi / 3.0)
+                x1 = projected_x + math.cos(spoke_angle) * max(2, radius * 0.25)
+                y1 = projected_y + math.sin(spoke_angle) * max(2, radius * 0.25)
+                x2 = projected_x - math.cos(spoke_angle) * max(2, radius * 0.25)
+                y2 = projected_y - math.sin(spoke_angle) * max(2, radius * 0.25)
+                cv2.line(canvas, (int(x1), int(y1)), (int(x2), int(y2)), (220, 220, 220), 1, cv2.LINE_AA)
+
+            cv2.circle(canvas, (projected_x, projected_y), max(2, radius // 5), (255, 210, 90), -1, cv2.LINE_AA)
+
+            axle_line = self._project((self.state.x + offset[0], self.state.y + offset[1], wheel_center[2] + 0.18), camera_pos, camera_target, camera_up, width, height, focal)
+            if axle_line is not None:
+                cv2.line(canvas, (projected_x, projected_y), (axle_line[0], axle_line[1]), (128, 133, 138), 1, cv2.LINE_AA)
 
         edges = [
             (0, 1), (1, 2), (2, 3), (3, 0),
@@ -964,12 +1098,34 @@ class Rover3DSim:
             cv2.circle(canvas, (headlight[0], headlight[1]), 4, (255, 245, 210), -1, cv2.LINE_AA)
             cv2.circle(canvas, (headlight[0], headlight[1]), 8, (255, 220, 120), 1, cv2.LINE_AA)
 
-        sensor_mast_base = (self.state.x - 0.1, self.state.y + 0.02, self.state.z + 0.35)
-        sensor_mast_tip = (self.state.x - 0.12, self.state.y + 0.02, self.state.z + 1.0)
-        self._draw_line_3d(canvas, sensor_mast_base, sensor_mast_tip, (235, 235, 235), 2, camera_pos, camera_target, camera_up, focal)
-        sensor_tip = self._project((sensor_mast_tip[0], sensor_mast_tip[1], sensor_mast_tip[2] + 0.04), camera_pos, camera_target, camera_up, width, height, focal)
-        if sensor_tip is not None:
-            cv2.circle(canvas, (sensor_tip[0], sensor_tip[1]), 3, (0, 255, 220), -1, cv2.LINE_AA)
+        sensor_base = (self.state.x - 0.1, self.state.y + 0.02, self.state.z + 0.35)
+        sensor_mast_tip = (self.state.x - 0.12, self.state.y + 0.02, self.state.z + 1.18)
+        sensor_brace_a = (self.state.x - 0.28, self.state.y - 0.14, self.state.z + 0.42)
+        sensor_brace_b = (self.state.x - 0.28, self.state.y + 0.18, self.state.z + 0.42)
+        self._draw_line_3d(canvas, sensor_base, sensor_mast_tip, (220, 220, 220), 2, camera_pos, camera_target, camera_up, focal)
+        self._draw_line_3d(canvas, sensor_base, sensor_brace_a, (195, 198, 204), 1, camera_pos, camera_target, camera_up, focal)
+        self._draw_line_3d(canvas, sensor_base, sensor_brace_b, (195, 198, 204), 1, camera_pos, camera_target, camera_up, focal)
+
+        sensor_body = [
+            (sensor_mast_tip[0] - 0.10, sensor_mast_tip[1] - 0.08, sensor_mast_tip[2] - 0.06),
+            (sensor_mast_tip[0] + 0.08, sensor_mast_tip[1] - 0.08, sensor_mast_tip[2] - 0.06),
+            (sensor_mast_tip[0] + 0.08, sensor_mast_tip[1] + 0.08, sensor_mast_tip[2] - 0.06),
+            (sensor_mast_tip[0] - 0.10, sensor_mast_tip[1] + 0.08, sensor_mast_tip[2] - 0.06),
+            (sensor_mast_tip[0] - 0.06, sensor_mast_tip[1] - 0.04, sensor_mast_tip[2] + 0.10),
+            (sensor_mast_tip[0] + 0.06, sensor_mast_tip[1] - 0.04, sensor_mast_tip[2] + 0.10),
+            (sensor_mast_tip[0] + 0.06, sensor_mast_tip[1] + 0.04, sensor_mast_tip[2] + 0.10),
+            (sensor_mast_tip[0] - 0.06, sensor_mast_tip[1] + 0.04, sensor_mast_tip[2] + 0.10),
+        ]
+        self._fill_polygon_3d(canvas, sensor_body, (160, 174, 182), camera_pos, camera_target, camera_up, focal)
+        self._draw_line_3d(canvas, sensor_body[0], sensor_body[1], (210, 220, 228), 1, camera_pos, camera_target, camera_up, focal)
+        self._draw_line_3d(canvas, sensor_body[1], sensor_body[2], (210, 220, 228), 1, camera_pos, camera_target, camera_up, focal)
+        self._draw_line_3d(canvas, sensor_body[2], sensor_body[3], (210, 220, 228), 1, camera_pos, camera_target, camera_up, focal)
+        self._draw_line_3d(canvas, sensor_body[3], sensor_body[0], (210, 220, 228), 1, camera_pos, camera_target, camera_up, focal)
+
+        sensor_lens = self._project((sensor_mast_tip[0], sensor_mast_tip[1], sensor_mast_tip[2] + 0.12), camera_pos, camera_target, camera_up, width, height, focal)
+        if sensor_lens is not None:
+            cv2.circle(canvas, (sensor_lens[0], sensor_lens[1]), 5, (0, 255, 220), -1, cv2.LINE_AA)
+            cv2.circle(canvas, (sensor_lens[0], sensor_lens[1]), 8, (120, 255, 220), 1, cv2.LINE_AA)
 
         self._draw_line_3d(
             canvas,
@@ -1001,12 +1157,27 @@ class Rover3DSim:
         rover_center = self._project((self.state.x, self.state.y, self.state.z + 0.1), camera_pos, camera_target, camera_up, width, height, focal)
         if route is not None and rover_center is not None:
             cv2.line(canvas, (rover_center[0], rover_center[1]), (route[0], route[1]), (0, 180, 255), 2, cv2.LINE_AA)
+            cv2.circle(canvas, (route[0], route[1]), 7, (0, 255, 180), -1, cv2.LINE_AA)
 
-        minimap = self._render_minimap()
-        history_panel = self._render_history_panel()
+        self._render_dust(canvas, camera_pos, camera_target, camera_up, focal, width, height)
 
-        canvas[14:304, width - 304:width - 14] = minimap
-        canvas[320:610, width - 304:width - 14] = history_panel
+        haze = np.linspace(0.0, 0.26, height, dtype=np.float32)[:, None]
+        haze_mask = np.repeat(haze, width, axis=1)
+        haze_rgb = np.array([36, 42, 44], dtype=np.float32)
+        canvas = canvas.astype(np.float32)
+        canvas = canvas * (1.0 - haze_mask)[:, :, None] + haze_rgb * haze_mask[:, :, None]
+        canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+
+        panel_w = min(290, max(180, width // 4))
+        panel_h = min(290, max(180, height // 3))
+        minimap = self._render_minimap((panel_w, panel_h))
+        history_panel = self._render_history_panel((panel_w, panel_h))
+
+        x0 = width - panel_w - 14
+        minimap_y = 14
+        history_y = min(height - panel_h - 14, minimap_y + panel_h + 16)
+        canvas[minimap_y:minimap_y + panel_h, x0:x0 + panel_w] = minimap
+        canvas[history_y:history_y + panel_h, x0:x0 + panel_w] = history_panel
 
         hud_lines = [
             f"Target: {target.name if target else 'none'}",
@@ -1032,6 +1203,9 @@ class Rover3DSim:
         cv2.rectangle(canvas, (14, height - 98), (width - 320, height - 8), (62, 56, 48), 1)
         cv2.putText(canvas, "DIRT Rover 3D Simulation", (18, height - 64), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (0, 255, 220), 2, cv2.LINE_AA)
         cv2.putText(canvas, "drill  scoop  spectrometer payload  smooth chase cam", (18, height - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (230, 230, 230), 1, cv2.LINE_AA)
+
+        if render_scale < 1.0:
+            canvas = cv2.resize(canvas, (resolution[0], resolution[1]), interpolation=cv2.INTER_LINEAR)
         return canvas
 
     def save_path_csv(self, path: str = "sim_rover_3d_path.csv") -> None:
@@ -1043,10 +1217,12 @@ def run_rover_3d_demo(
     show_video: bool = True,
     save_csv: bool = True,
     delay_ms: int = 40,
+    target_fps: float = 90.0,
     max_steps: int = 420,
     waypoint_tolerance_m: float = 0.45,
     control_mode: str = "pursuit",
     terrain_mode: str = "rolling",
+    display_resolution: Tuple[int, int] = (2560, 1440),
     csv_path: str = "sim_rover_3d_path.csv",
     run_label: str = "demo",
     start_manual: bool = False,
@@ -1058,10 +1234,33 @@ def run_rover_3d_demo(
         terrain_mode=terrain_mode,
     )
     sim.manual_mode = start_manual
+    if show_video:
+        cv2.namedWindow("DIRT Sim - Rover 3D", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("DIRT Sim - Rover 3D", display_resolution[0], display_resolution[1])
     log.info("Starting 3D rover demo with %d waypoints", len(sim.waypoints))
 
+    render_scale = 1.0
+    if show_video and max(display_resolution) > 1600:
+        render_scale = 0.75 if target_fps >= 90.0 else 0.85
+    render_width = max(1, int(display_resolution[0] * render_scale))
+    render_height = max(1, int(display_resolution[1] * render_scale))
+    render_resolution = (render_width, render_height)
+    log.info("Display size: %sx%s -> render size: %sx%s (scale %.2fx)", display_resolution[0], display_resolution[1], render_width, render_height, render_scale)
+
     finished = False
-    for step in range(max_steps):
+    step = 0
+    last_tick = time.perf_counter()
+    last_frame = last_tick
+    target_fps = float(_clamp(target_fps, 60.0, 120.0))
+    frame_interval = 1.0 / target_fps
+    display_wait = max(1, min(12, max(1, delay_ms // 4)))
+    log.info("Target render FPS: %.1f", target_fps)
+
+    while step < max_steps:
+        now = time.perf_counter()
+        elapsed = min(0.05, max(0.008, now - last_tick))
+        last_tick = now
+
         target = sim.current_waypoint()
         target_name = target.name if target else "done"
         dx = (target.x - sim.state.x) if target else 0.0
@@ -1074,7 +1273,7 @@ def run_rover_3d_demo(
         power_draw = sim._estimate_power_draw(target_bearing_deg, slope_mag, sim.state.speed)
         wheel_slip = sim._estimate_wheel_slip(slope_mag, target_bearing_deg)
 
-        finished = sim.step()
+        finished = sim.step(elapsed)
         terrain_height = sim.terrain.height(sim.state.x, sim.state.y)
         sim.log.record(
             step,
@@ -1092,10 +1291,13 @@ def run_rover_3d_demo(
             target is None,
         )
 
-        if show_video:
-            frame = sim.render()
+        if show_video and (now - last_frame >= frame_interval):
+            frame = sim.render(render_resolution)
+            if render_resolution != display_resolution:
+                frame = cv2.resize(frame, display_resolution, interpolation=cv2.INTER_LINEAR)
             cv2.imshow("DIRT Sim - Rover 3D", frame)
-            key = cv2.waitKey(delay_ms) & 0xFF
+            last_frame = now
+            key = cv2.waitKey(display_wait) & 0xFF
             if sim.handle_key(key):
                 log.info("Quit by user")
                 break
@@ -1103,6 +1305,8 @@ def run_rover_3d_demo(
         if finished:
             log.info("3D rover mission complete in %d steps", step + 1)
             break
+
+        step += 1
 
     if show_video:
         cv2.destroyAllWindows()
@@ -1137,7 +1341,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DIRT rover 3D simulation")
     parser.add_argument("--no-gui", action="store_true", help="Run headless")
     parser.add_argument("--iters", type=int, default=420, help="Max simulation steps")
-    parser.add_argument("--speed", type=int, default=40, help="Frame delay ms")
+    parser.add_argument("--speed", type=int, default=40, help="Legacy frame delay ms (kept for compatibility)")
+    parser.add_argument("--fps", type=float, default=90.0, help="Target render rate in FPS, between 60 and 120")
+    parser.add_argument("--resolution", type=str, default="2560x1440", help="Display resolution as WIDTHxHEIGHT, e.g. 2560x1440")
     parser.add_argument("--waypoints", type=str, default=None, help="Optional CSV with columns name,x,y")
     parser.add_argument("--csv", type=str, default="sim_rover_3d_path.csv", help="CSV output path")
     parser.add_argument("--control-mode", choices=sorted(CONTROL_PROFILES.keys()), default="pursuit", help="Motion control profile")
@@ -1147,15 +1353,21 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     custom_waypoints = _build_waypoints_from_csv(args.waypoints) if args.waypoints else None
+    try:
+        width, height = (int(v) for v in args.resolution.lower().split("x", 1))
+    except ValueError:
+        width, height = 2560, 1440
     log.info("Controls: W/S throttle, A/D steer, M manual toggle, Space pause, R reset, X zero, 1 auto, Q quit")
     run_rover_3d_demo(
         waypoints=custom_waypoints,
         show_video=not args.no_gui,
         save_csv=True,
         delay_ms=args.speed,
+        target_fps=args.fps,
         max_steps=args.iters,
         control_mode=args.control_mode,
         terrain_mode=args.terrain_mode,
+        display_resolution=(width, height),
         csv_path=args.csv,
         run_label=args.label,
         start_manual=args.manual,

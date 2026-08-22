@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 import math
 import random
@@ -61,6 +62,21 @@ class Waypoint:
     local: Optional[Pose2D] = None
     drilled: bool = False
     measured: bool = False
+    action: str = "sample"
+    tolerance_m: float = 0.5
+
+    @classmethod
+    def from_csv_row(cls, row: dict) -> "Waypoint":
+        gps = GPSCoord(
+            lat=float(row.get("lat") or row.get("latitude") or 0.0),
+            lon=float(row.get("lon") or row.get("lng") or row.get("longitude") or 0.0),
+        )
+        return cls(
+            name=str(row.get("name") or "Waypoint"),
+            gps=gps,
+            action=str(row.get("action") or "sample"),
+            tolerance_m=float(row.get("tolerance_m") or row.get("tolerance") or 0.5),
+        )
 
 
 class NavState(Enum):
@@ -190,6 +206,24 @@ class Navigator:
         self.current_wp_idx = 0
         self.current_target: Optional[str] = None
 
+    @staticmethod
+    def from_csv(path: str) -> "Navigator":
+        with open(path, newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        if not rows:
+            raise ValueError(f"No waypoint rows found in {path}")
+        waypoints = [Waypoint.from_csv_row(row) for row in rows]
+        return Navigator(waypoints)
+
+    def status(self) -> dict:
+        current = self.current_waypoint
+        return {
+            "state": self.state.name,
+            "waypoint_index": self.current_wp_idx,
+            "current_waypoint": current.name if current else None,
+            "remaining": max(0, len(self.waypoints) - self.current_wp_idx),
+        }
+
     def set_target(self, target: str) -> None:
         self.current_target = target
 
@@ -293,6 +327,56 @@ class Navigator:
                 break
 
             time.sleep(tick_delay)
+
+    def run_mission(self, ticks: int = 120, tick_delay: float = 0.2) -> list[dict]:
+        """Drive through the configured waypoint list and return a summary of progress."""
+        if not self.waypoints:
+            log.warning("No waypoints configured for mission")
+            return []
+
+        results: list[dict] = []
+        self.state = NavState.IDLE
+        self.current_wp_idx = 0
+
+        for tick in range(ticks):
+            if self.current_waypoint is None:
+                self.state = NavState.DONE
+                break
+
+            current = self.current_waypoint
+            gps = self.gps.read()
+            dist = gps.distance_to(current.gps)
+            bearing = gps.bearing_to(current.gps)
+            heading_error = (bearing - self.slam.get_pose().yaw) % 360
+            if heading_error > 180:
+                heading_error -= 360
+
+            log.info(
+                "Mission tick %d: %s | dist=%.2fm | bearing=%.1fdeg | heading_error=%.1fdeg | action=%s",
+                tick,
+                current.name,
+                dist,
+                bearing,
+                heading_error,
+                current.action,
+            )
+
+            if dist <= current.tolerance_m:
+                results.append({
+                    "waypoint": current.name,
+                    "status": "reached",
+                    "distance_m": round(dist, 3),
+                    "action": current.action,
+                })
+                log.info("Reached waypoint %s (%s)", current.name, current.action)
+                self.current_wp_idx += 1
+                self.state = NavState.GPS_NAVIGATE if self.current_waypoint else NavState.DONE
+                if self.state == NavState.DONE:
+                    break
+            time.sleep(tick_delay)
+
+        log.info("Mission complete: %d waypoints reached", len(results))
+        return results
 
 
 if __name__ == "__main__":
