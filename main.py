@@ -117,8 +117,12 @@ def _run_mission_from_csv(path: str):
 
 def _run_rover_3d_test():
     """Full 3D rover motion demo over terrain."""
-    from simulation.rover_3d_sim import run_rover_3d_demo
-    log.info("Running 3D rover demo…")
+    try:
+        from simulation.rover_3d_panda import run_rover_3d_demo
+        log.info("Running 3D rover demo with Panda3D…")
+    except Exception:
+        from simulation.rover_3d_sim import run_rover_3d_demo
+        log.info("Running 3D rover demo with the OpenCV fallback…")
     run_rover_3d_demo(show_video=True, save_csv=True)
 
 

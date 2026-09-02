@@ -4,5 +4,6 @@ gpiozero
 scikit-learn
 smbus2
 pyserial
+panda3d
 RPi.GPIO; platform_system=="Linux"
 rclpy; extra == "ros"
