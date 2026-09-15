@@ -13,8 +13,11 @@ import argparse
 import csv
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import Deque, List, Optional, Sequence, Tuple
+
+import numpy as np
 
 from direct.gui.OnscreenText import OnscreenText
 from direct.showbase.ShowBase import ShowBase
@@ -42,9 +45,6 @@ from panda3d.core import (
     TransparencyAttrib,
 )
 
-from spectrometer.spectrometer import SoilAnalysisResult
-
-
 
 log = logging.getLogger("rover3d-panda")
 
@@ -55,7 +55,16 @@ CONTROL_PROFILES = {
     "aggressive": {"max_speed_mps": 1.00, "steering_gain": 2.80, "accel_mps2": 0.62},
 }
 
-TERRAIN_PROFILES = {"grassland", "rolling", "dunes", "rocky"}
+# NOTE: "farmland" is intentionally included here (not just grassland/rolling/
+# dunes/rocky) - _make_terrain() has a dedicated row/furrow/dirt-lane texture
+# for it, and Rover3DPandaApp defaults to terrain_mode="farmland". Previously
+# "farmland" was missing from this set, so the constructor's own validation
+# (`if terrain_mode not in TERRAIN_PROFILES: terrain_mode = "grassland"`)
+# silently downgraded every default run to grassland and the farmland texture
+# was dead code.
+TERRAIN_PROFILES = {"grassland", "rolling", "dunes", "rocky", "farmland"}
+
+TRAIL_MAX_POINTS = 220
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -109,11 +118,6 @@ class RoverSample:
     power_draw: float
     path_curvature: float
     reached: bool
-    soil_moisture_pct: Optional[float] = None
-    organic_matter_pct: Optional[float] = None
-    iron_oxide_idx: Optional[float] = None
-    spectrometer_confidence: Optional[float] = None
-    spectrometer_temp_c: Optional[float] = None
 
 
 @dataclass
@@ -135,7 +139,6 @@ class MotionLog:
         power_draw: float,
         path_curvature: float,
         reached: bool,
-        soil_result: Optional[SoilAnalysisResult] = None,
     ) -> None:
         self.rows.append(
             RoverSample(
@@ -158,11 +161,6 @@ class MotionLog:
                 power_draw=round(power_draw, 3),
                 path_curvature=round(path_curvature, 3),
                 reached=reached,
-                soil_moisture_pct=(round(soil_result.moisture_pct, 1) if soil_result else None),
-                organic_matter_pct=(round(soil_result.organic_matter_pct, 1) if soil_result else None),
-                iron_oxide_idx=(round(soil_result.iron_oxide_idx, 3) if soil_result else None),
-                spectrometer_confidence=(round(soil_result.confidence, 3) if soil_result else None),
-                spectrometer_temp_c=(round(soil_result.raw_spectrum.temperature_c, 2) if soil_result else None),
             )
         )
 
@@ -182,32 +180,49 @@ class TerrainField:
         self.span_m = span_m
         self.terrain_mode = terrain_mode if terrain_mode in TERRAIN_PROFILES else "grassland"
 
-    def height(self, x: float, y: float) -> float:
+    def height(self, x, y):
+        """Height at (x, y). Accepts scalars or numpy arrays (broadcast)."""
         if self.terrain_mode == "grassland":
-            base = 0.015 * math.sin(x / 6.8) + 0.012 * math.cos(y / 7.6)
-            brush = 0.008 * math.sin((x + y) / 5.8)
-            track = 0.006 * math.cos((x - 0.6 * y) / 6.5)
+            base = 0.015 * np.sin(x / 6.8) + 0.012 * np.cos(y / 7.6)
+            brush = 0.008 * np.sin((x + y) / 5.8)
+            track = 0.006 * np.cos((x - 0.6 * y) / 6.5)
             return base + brush + track
         if self.terrain_mode == "dunes":
-            return 0.55 * math.sin(x / 2.4) + 0.25 * math.sin((x + y) / 3.6) + 0.14 * math.cos(y / 4.4)
+            return 0.55 * np.sin(x / 2.4) + 0.25 * np.sin((x + y) / 3.6) + 0.14 * np.cos(y / 4.4)
         if self.terrain_mode == "rocky":
             return (
-                0.35 * math.sin(x / 1.8)
-                + 0.25 * math.cos(y / 2.2)
-                + 0.12 * math.sin((x * 1.7 + y * 1.3) / 1.6)
-                + 0.08 * math.cos(math.hypot(x, y) / 1.4)
+                0.35 * np.sin(x / 1.8)
+                + 0.25 * np.cos(y / 2.2)
+                + 0.12 * np.sin((x * 1.7 + y * 1.3) / 1.6)
+                + 0.08 * np.cos(np.hypot(x, y) / 1.4)
             )
         return (
-            0.45 * math.sin(x / 2.9)
-            + 0.35 * math.cos(y / 3.4)
-            + 0.18 * math.sin((x + y) / 4.5)
-            + 0.08 * math.cos(math.hypot(x, y) / 2.7)
+            0.45 * np.sin(x / 2.9)
+            + 0.35 * np.cos(y / 3.4)
+            + 0.18 * np.sin((x + y) / 4.5)
+            + 0.08 * np.cos(np.hypot(x, y) / 2.7)
         )
 
     def gradient(self, x: float, y: float, delta: float = 0.15) -> Tuple[float, float]:
         dx = (self.height(x + delta, y) - self.height(x - delta, y)) / (2.0 * delta)
         dy = (self.height(x, y + delta) - self.height(x, y - delta)) / (2.0 * delta)
         return dx, dy
+
+    def height_and_gradient_grid(
+        self, xs: np.ndarray, ys: np.ndarray, delta: float = 0.15
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Vectorized height + gradient over a full (len(ys), len(xs)) grid.
+
+        Used by _make_terrain to build the whole mesh with a handful of
+        numpy calls instead of one Python-level height()/gradient() call
+        per vertex (which, at resolution=48, was ~7000 scalar trig
+        evaluations run through the interpreter on every scene build).
+        """
+        gx, gy = np.meshgrid(xs, ys)
+        z = self.height(gx, gy)
+        slope_x = (self.height(gx + delta, gy) - self.height(gx - delta, gy)) / (2.0 * delta)
+        slope_y = (self.height(gx, gy + delta) - self.height(gx, gy - delta)) / (2.0 * delta)
+        return z, slope_x, slope_y
 
 
 class Rover3DPandaApp(ShowBase):
@@ -263,7 +278,8 @@ class Rover3DPandaApp(ShowBase):
         self._camera_target = LVector3f(self.state.x + 2.0, self.state.y + 1.0, self.state.z + 0.2)
         self._render_frame = 0
         self._wheel_rotation = 0.0
-        self._trail_points: List[Tuple[float, float, float]] = []
+        self._trail_points: Deque[Tuple[float, float, float]] = deque(maxlen=TRAIL_MAX_POINTS)
+        self._trail_dirty = True
         self.log = MotionLog()
 
         self.manual_mode = False
@@ -381,6 +397,16 @@ class Rover3DPandaApp(ShowBase):
         return np_node
 
     def _make_terrain(self, resolution: int = 48) -> NodePath:
+        """Build the terrain mesh.
+
+        Height/normal/color for all resolution*resolution vertices are
+        computed with a handful of vectorized numpy calls (see
+        TerrainField.height_and_gradient_grid) instead of one Python
+        function call per vertex per axis. GeomVertexWriter still needs a
+        per-vertex write (Panda3D's API has no bulk-array insert), but the
+        expensive trig math that used to run at the interpreter level now
+        runs once, vectorized, before that loop.
+        """
         format_ = GeomVertexFormat.getV3n3c4()
         vdata = GeomVertexData("terrain", format_, Geom.UHStatic)
         vertex = GeomVertexWriter(vdata, "vertex")
@@ -389,56 +415,66 @@ class Rover3DPandaApp(ShowBase):
         tris = GeomTriangles(Geom.UHStatic)
 
         half = self.terrain.span_m / 2.0
-        xs = [(-half + (2.0 * half) * i / (resolution - 1)) for i in range(resolution)]
-        ys = [(-half + (2.0 * half) * i / (resolution - 1)) for i in range(resolution)]
+        xs = np.linspace(-half, half, resolution)
+        ys = np.linspace(-half, half, resolution)
+
+        z_grid, slope_x_grid, slope_y_grid = self.terrain.height_and_gradient_grid(xs, ys)
+
+        nx_grid = -slope_x_grid
+        ny_grid = -slope_y_grid
+        nz_grid = np.ones_like(z_grid)
+        length_grid = np.sqrt(nx_grid**2 + ny_grid**2 + nz_grid**2)
+        length_grid[length_grid == 0] = 1.0
+        nx_grid /= length_grid
+        ny_grid /= length_grid
+        nz_grid /= length_grid
+
+        height_t_grid = np.clip((z_grid + 0.8) / 1.6, 0.0, 1.0)
+
+        gx, gy = np.meshgrid(xs, ys)
+
+        if self.terrain_mode == "farmland":
+            row_band = 0.5 + 0.5 * np.sin(gy * 4.8)
+            furrow_band = 0.5 + 0.5 * np.sin((gx * 2.6 + gy * 0.2) * 2.4)
+            dirt_lane = 0.5 + 0.5 * np.sin((gx - 0.35 * gy) * 1.3)
+            band_mix = 0.58 * row_band + 0.28 * furrow_band + 0.14 * dirt_lane
+
+            base_grid = np.empty(band_mix.shape + (3,))
+            top_grid = np.empty(band_mix.shape + (3,))
+            high = band_mix > 0.62
+            mid = (band_mix > 0.42) & ~high
+            low = ~high & ~mid
+            base_grid[high] = (0.34, 0.24, 0.12)
+            top_grid[high] = (0.44, 0.58, 0.18)
+            base_grid[mid] = (0.48, 0.36, 0.16)
+            top_grid[mid] = (0.34, 0.24, 0.12)
+            base_grid[low] = (0.28, 0.22, 0.10)
+            top_grid[low] = (0.40, 0.34, 0.14)
+        elif self.terrain_mode == "dunes":
+            base_grid = np.tile((0.82, 0.70, 0.40), z_grid.shape + (1,))
+            top_grid = np.tile((0.96, 0.88, 0.62), z_grid.shape + (1,))
+        elif self.terrain_mode == "rocky":
+            base_grid = np.tile((0.36, 0.36, 0.34), z_grid.shape + (1,))
+            top_grid = np.tile((0.58, 0.54, 0.48), z_grid.shape + (1,))
+        else:
+            base_grid = np.tile((0.32, 0.42, 0.24), z_grid.shape + (1,))
+            top_grid = np.tile((0.60, 0.58, 0.34), z_grid.shape + (1,))
+
+        height_t_3 = height_t_grid[..., None]
+        rgb_grid = base_grid * (1.0 - height_t_3) + top_grid * height_t_3
 
         index_grid: List[List[int]] = []
         index = 0
-        for y in ys:
-            row: List[int] = []
-            for x in xs:
-                z = self.terrain.height(x, y)
-                slope_x, slope_y = self.terrain.gradient(x, y)
-                nx, ny, nz = -slope_x, -slope_y, 1.0
-                length = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
-                nx /= length
-                ny /= length
-                nz /= length
-
-                height_t = _clamp((z + 0.8) / 1.6, 0.0, 1.0)
-                if self.terrain_mode == "farmland":
-                    row_band = 0.5 + 0.5 * math.sin(y * 4.8)
-                    furrow_band = 0.5 + 0.5 * math.sin((x * 2.6 + y * 0.2) * 2.4)
-                    dirt_lane = 0.5 + 0.5 * math.sin((x - 0.35 * y) * 1.3)
-                    band_mix = 0.58 * row_band + 0.28 * furrow_band + 0.14 * dirt_lane
-                    if band_mix > 0.62:
-                        base = (0.34, 0.24, 0.12)
-                        top = (0.44, 0.58, 0.18)
-                    elif band_mix > 0.42:
-                        base = (0.48, 0.36, 0.16)
-                        top = (0.34, 0.24, 0.12)
-                    else:
-                        base = (0.28, 0.22, 0.10)
-                        top = (0.40, 0.34, 0.14)
-                elif self.terrain_mode == "dunes":
-                    base = (0.82, 0.70, 0.40)
-                    top = (0.96, 0.88, 0.62)
-                elif self.terrain_mode == "rocky":
-                    base = (0.36, 0.36, 0.34)
-                    top = (0.58, 0.54, 0.48)
-                else:
-                    base = (0.32, 0.42, 0.24)
-                    top = (0.60, 0.58, 0.34)
-                r = base[0] * (1.0 - height_t) + top[0] * height_t
-                g = base[1] * (1.0 - height_t) + top[1] * height_t
-                b = base[2] * (1.0 - height_t) + top[2] * height_t
-
-                vertex.addData3f(x, y, z)
-                normal.addData3f(nx, ny, nz)
-                color.addData4f(r, g, b, 1.0)
-                row.append(index)
+        for row in range(resolution):
+            row_indices: List[int] = []
+            for col in range(resolution):
+                vertex.addData3f(float(gx[row, col]), float(gy[row, col]), float(z_grid[row, col]))
+                normal.addData3f(float(nx_grid[row, col]), float(ny_grid[row, col]), float(nz_grid[row, col]))
+                r, g, b = rgb_grid[row, col]
+                color.addData4f(float(r), float(g), float(b), 1.0)
+                row_indices.append(index)
                 index += 1
-            index_grid.append(row)
+            index_grid.append(row_indices)
 
         for row in range(resolution - 1):
             for col in range(resolution - 1):
@@ -489,22 +525,37 @@ class Rover3DPandaApp(ShowBase):
         shadow.setScale(1.0, 1.0, 1.0)
         return shadow
 
-    def _make_soft_disc_texture(self, name: str, core: Tuple[float, float, float], edge: Tuple[float, float, float, float]) -> Texture:
-        image = PNMImage(128, 128, 4)
+    def _make_soft_disc_texture(
+        self, name: str, core: Tuple[float, float, float], edge: Tuple[float, float, float, float]
+    ) -> Texture:
+        """Radial gradient disc used for the sun/cloud sprites.
+
+        The alpha falloff and RGBA blend for all 128*128 pixels are computed
+        with numpy in a few vector ops. PNMImage has no bulk-array setter,
+        so writing the result still needs one setXelA() call per pixel, but
+        that loop is now pure array indexing instead of also doing the
+        sqrt/smoothstep/lerp math per pixel in the interpreter.
+        """
+        size = 128
+        idx = np.arange(size)
+        gx, gy = np.meshgrid(idx, idx)
+        dx = (gx - 63.5) / 63.5
+        dy = (gy - 63.5) / 63.5
+        dist = np.sqrt(dx**2 + dy**2)
+        alpha = np.clip(1.0 - dist, 0.0, 1.0)
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+
+        r = edge[0] * (1.0 - alpha) + core[0] * alpha
+        g = edge[1] * (1.0 - alpha) + core[1] * alpha
+        b = edge[2] * (1.0 - alpha) + core[2] * alpha
+        a = edge[3] * (1.0 - alpha) + alpha
+
+        image = PNMImage(size, size, 4)
         image.fill(0.0, 0.0, 0.0)
         image.alphaFill(0.0)
-        for x in range(128):
-            for y in range(128):
-                dx = (x - 63.5) / 63.5
-                dy = (y - 63.5) / 63.5
-                dist = math.sqrt(dx * dx + dy * dy)
-                alpha = _clamp(1.0 - dist, 0.0, 1.0)
-                alpha = alpha * alpha * (3.0 - 2.0 * alpha)
-                r = edge[0] * (1.0 - alpha) + core[0] * alpha
-                g = edge[1] * (1.0 - alpha) + core[1] * alpha
-                b = edge[2] * (1.0 - alpha) + core[2] * alpha
-                a = edge[3] * (1.0 - alpha) + alpha
-                image.setXelA(x, y, r, g, b, a)
+        for y in range(size):
+            for x in range(size):
+                image.setXelA(x, y, float(r[y, x]), float(g[y, x]), float(b[y, x]), float(a[y, x]))
 
         texture = Texture(name)
         texture.load(image)
@@ -1101,6 +1152,7 @@ class Rover3DPandaApp(ShowBase):
         self.step_idx = 0
         self.finished = False
         self._trail_points.clear()
+        self._trail_dirty = True
         self.manual_throttle = 0.0
         self.manual_steer = 0.0
         self.mission_phase = "drive_to_drill"
@@ -1180,7 +1232,7 @@ class Rover3DPandaApp(ShowBase):
         self._update_body_orientation()
         self._wheel_rotation += self.state.speed * dt * 4.4
         self._trail_points.append((self.state.x, self.state.y, self.state.z))
-        self._trail_points = self._trail_points[-220:]
+        self._trail_dirty = True
 
         return distance <= tolerance_m
 
@@ -1227,7 +1279,7 @@ class Rover3DPandaApp(ShowBase):
         self._update_body_orientation()
         self._wheel_rotation += self.state.speed * dt * 4.4
         self._trail_points.append((self.state.x, self.state.y, self.state.z))
-        self._trail_points = self._trail_points[-220:]
+        self._trail_dirty = True
 
     def _step_autonomous(self, dt: float) -> bool:
         target = self._current_waypoint()
@@ -1235,6 +1287,7 @@ class Rover3DPandaApp(ShowBase):
             self.state.speed = 0.0
             self._update_body_orientation()
             self._trail_points.append((self.state.x, self.state.y, self.state.z))
+            self._trail_dirty = True
             return True
 
         if self._drive_towards_point(target.x, target.y, dt):
@@ -1407,19 +1460,30 @@ class Rover3DPandaApp(ShowBase):
             self._trail_np = None
 
     def _update_trail(self) -> None:
+        # Only rebuild the LineSegs geometry when new points actually came
+        # in (or reset_pose asked for a rebuild). Previously this ran a
+        # full remove+recreate of the trail geometry every frame - including
+        # every paused frame, where the rover isn't moving and the trail
+        # never changes.
+        if not self._trail_dirty:
+            return
+
         if len(self._trail_points) < 2:
             self._trail_rebuild()
+            self._trail_dirty = False
             return
 
         self._trail_rebuild()
         segs = LineSegs("trail")
         segs.setThickness(4.0)
         segs.setColor(1.0, 0.58, 0.10, 1.0)
-        first = self._trail_points[0]
+        points = list(self._trail_points)
+        first = points[0]
         segs.moveTo(first[0], first[1], first[2] + 0.06)
-        for point in self._trail_points[1:]:
+        for point in points[1:]:
             segs.drawTo(point[0], point[1], point[2] + 0.06)
         self._trail_np = self.render.attachNewNode(segs.create())
+        self._trail_dirty = False
 
     def _update_task(self, task):
         if self._quit_requested:

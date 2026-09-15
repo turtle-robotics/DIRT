@@ -195,7 +195,7 @@ class AS7265xDriver:
                 val = float(np.frombuffer(bs, dtype='>f4')[0])
                 result[wl] = float(val)
             except Exception:
-                # On error return zero for this channel
+                log.warning("AS7265x channel %dnm read failed; returning 0.0", wl, exc_info=True)
                 result[wl] = 0.0
         return result
 
@@ -218,19 +218,20 @@ class MockAS7265xDriver:
                           0.60, 0.63, 0.66, 0.69, 0.71, 0.73]),
     }
 
-    def __init__(self, soil_type: str = "loam", scale: float = 10_000.0):
+    def __init__(self, soil_type: str = "loam", scale: float = 10_000.0, rng: Optional[np.random.Generator] = None):
         self._base = self._SOIL_BASES.get(soil_type, self._SOIL_BASES["loam"])
         self._scale = scale
+        self._rng = rng or np.random.default_rng()
         log.info("[AS7265x] Mock driver active (soil_type=%s)", soil_type)
 
     def read_calibrated(self) -> Dict[int, float]:
-        noise = np.random.normal(0, 0.01, len(WAVELENGTHS_NM))
+        noise = self._rng.normal(0, 0.01, len(WAVELENGTHS_NM))
         counts = (self._base + noise) * self._scale
         counts = np.clip(counts, 0, None)
         return {wl: float(c) for wl, c in zip(WAVELENGTHS_NM, counts)}
 
     def read_temperature(self) -> float:
-        return 25.0 + np.random.normal(0, 0.5)
+        return 25.0 + float(self._rng.normal(0, 0.5))
 
 
 def _make_driver():
@@ -288,6 +289,7 @@ class SoilPLSModel:
             self._coeffs = None
             self._X_mean = None
             self._X_std = None
+            self._cov_inv = None
             return
 
         from sklearn.cross_decomposition import PLSRegression
@@ -298,6 +300,7 @@ class SoilPLSModel:
         self._scaler = StandardScaler()
         self._trained = False
         self._X_train: Optional[np.ndarray] = None
+        self._cov_inv: Optional[np.ndarray] = None
 
     def fit(self, X_raw: np.ndarray, y: np.ndarray):
         X_pre = np.apply_along_axis(preprocess, 1, X_raw)
@@ -307,6 +310,7 @@ class SoilPLSModel:
             self._pls.fit(X_sc, y)
             self._X_train = X_sc
             self._trained = True
+            self._cache_covariance()
             log.info("PLS model fitted: %d samples, %d components", len(X_raw), self.n_components)
             return
 
@@ -324,7 +328,18 @@ class SoilPLSModel:
         self._X_std = X_std
         self._X_train = X_sc
         self._trained = True
+        self._cache_covariance()
         log.info("Fallback linear model fitted: %d samples", len(X_raw))
+
+    def _cache_covariance(self):
+        """Precompute the inverse covariance matrix used for Hotelling's T^2
+        confidence so we don't redo an O(features^3) inversion on every
+        single prediction call."""
+        if self._X_train is None:
+            self._cov_inv = None
+            return
+        cov = np.cov(self._X_train.T) + np.eye(self._X_train.shape[1]) * 1e-6
+        self._cov_inv = np.linalg.inv(cov)
 
     def predict(self, spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
         if not self._trained:
@@ -370,10 +385,13 @@ class SoilPLSModel:
     def _hotelling_confidence(self, x_sc: np.ndarray) -> float:
         if self._X_train is None:
             return 0.0
+        if self._cov_inv is None:
+            self._cache_covariance()
+            if self._cov_inv is None:
+                return 0.0
         mean = self._X_train.mean(axis=0)
         diff = x_sc[0] - mean
-        cov = np.cov(self._X_train.T) + np.eye(self._X_train.shape[1]) * 1e-6
-        maha2 = float(diff @ np.linalg.inv(cov) @ diff)
+        maha2 = float(diff @ self._cov_inv @ diff)
         conf = float(np.exp(-0.05 * maha2))
         return round(min(1.0, max(0.0, conf)), 3)
 
