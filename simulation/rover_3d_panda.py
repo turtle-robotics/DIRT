@@ -27,22 +27,23 @@ from panda3d.core import (
     CardMaker,
     ClockObject,
     DirectionalLight,
+    Fog,
+    Filename,
     Geom,
     GeomNode,
     GeomTriangles,
     GeomVertexData,
     GeomVertexFormat,
     GeomVertexWriter,
-    Fog,
-    Filename,
     LVector3f,
     LineSegs,
-    NodePath,
     Material,
+    NodePath,
     PNMImage,
     Texture,
     TextNode,
     TransparencyAttrib,
+    WindowProperties,
 )
 
 
@@ -77,6 +78,142 @@ def _wrap_angle_deg(angle: float) -> float:
 
 def _lerp(value: float, target: float, alpha: float) -> float:
     return value + (target - value) * _clamp(alpha, 0.0, 1.0)
+
+
+def normalize_resolution(value: Optional[Tuple[int, int] | str]) -> Tuple[int, int]:
+    """Normalize the requested window size and keep it in a sane range."""
+    if value is None:
+        return (2560, 1440)
+
+    if isinstance(value, str):
+        try:
+            width_text, height_text = value.lower().split("x", 1)
+            width = max(640, int(width_text))
+            height = max(360, int(height_text))
+            return width, height
+        except ValueError:
+            return (2560, 1440)
+
+    width, height = value
+    return max(640, int(width)), max(360, int(height))
+
+
+def clamp_target_fps(value: float) -> float:
+    """Keep the frame target in a plausible smooth-sim range."""
+    fps = float(value)
+    if fps <= 0:
+        return 90.0
+    return max(60.0, min(120.0, fps))
+
+
+def terrain_palette(terrain_mode: str, height: float) -> Tuple[float, float, float]:
+    """Return a richer terrain RGB color for a given terrain profile and height."""
+    h = float(height)
+    if terrain_mode == "dunes":
+        if h < -0.05:
+            return (0.42, 0.36, 0.24)
+        if h < 0.30:
+            return (0.71, 0.57, 0.36)
+        return (0.94, 0.80, 0.52)
+    if terrain_mode == "rocky":
+        if h < 0.10:
+            return (0.24, 0.22, 0.20)
+        if h < 0.45:
+            return (0.43, 0.40, 0.35)
+        return (0.62, 0.58, 0.51)
+    if terrain_mode == "farmland":
+        if h < -0.08:
+            return (0.28, 0.20, 0.12)
+        if h < 0.12:
+            return (0.52, 0.39, 0.20)
+        if h < 0.42:
+            return (0.62, 0.51, 0.23)
+        return (0.72, 0.66, 0.32)
+    if terrain_mode == "grassland":
+        if h < 0.0:
+            return (0.20, 0.26, 0.18)
+        if h < 0.30:
+            return (0.36, 0.46, 0.25)
+        return (0.57, 0.65, 0.38)
+    if h < 0.0:
+        return (0.26, 0.24, 0.22)
+    if h < 0.35:
+        return (0.44, 0.40, 0.30)
+    return (0.78, 0.70, 0.55)
+
+
+def lighting_profile(terrain_mode: str) -> dict:
+    """Return stronger contrast lighting defaults tuned to the scene."""
+    if terrain_mode == "farmland":
+        return {
+            "ambient": (0.26, 0.27, 0.30, 1.0),
+            "sun_color": (1.00, 0.88, 0.72, 1.0),
+            "fill_color": (0.16, 0.24, 0.42, 1.0),
+            "background": (0.54, 0.68, 0.74, 1.0),
+            "fog_color": (0.56, 0.72, 0.80),
+            "fog_density": 0.012,
+        }
+    if terrain_mode == "dunes":
+        return {
+            "ambient": (0.42, 0.34, 0.30, 1.0),
+            "sun_color": (1.00, 0.92, 0.78, 1.0),
+            "fill_color": (0.22, 0.20, 0.32, 1.0),
+            "background": (0.72, 0.76, 0.70, 1.0),
+            "fog_color": (0.72, 0.78, 0.74),
+            "fog_density": 0.009,
+        }
+    if terrain_mode == "rocky":
+        return {
+            "ambient": (0.30, 0.28, 0.32, 1.0),
+            "sun_color": (0.96, 0.90, 0.82, 1.0),
+            "fill_color": (0.18, 0.20, 0.28, 1.0),
+            "background": (0.48, 0.52, 0.58, 1.0),
+            "fog_color": (0.60, 0.64, 0.70),
+            "fog_density": 0.011,
+        }
+    return {
+        "ambient": (0.32, 0.34, 0.38, 1.0),
+        "sun_color": (1.00, 0.93, 0.80, 1.0),
+        "fill_color": (0.22, 0.30, 0.42, 1.0),
+        "background": (0.54, 0.68, 0.74, 1.0),
+        "fog_color": (0.56, 0.70, 0.74),
+        "fog_density": 0.010,
+    }
+
+
+def weather_profile(terrain_mode: str) -> dict:
+    """Return a richer atmospheric profile with haze, glow, and cloud depth."""
+    if terrain_mode == "farmland":
+        return {
+            "mist_color": (0.78, 0.82, 0.85),
+            "mist_density": 0.016,
+            "sun_glow": (1.00, 0.72, 0.34, 0.88),
+            "cloud_alpha": 0.28,
+            "sun_bloom": 1.12,
+        }
+    if terrain_mode == "dunes":
+        return {
+            "mist_color": (0.86, 0.82, 0.76),
+            "mist_density": 0.013,
+            "sun_glow": (1.00, 0.86, 0.60, 0.82),
+            "cloud_alpha": 0.22,
+            "sun_bloom": 1.08,
+        }
+    if terrain_mode == "rocky":
+        return {
+            "mist_color": (0.72, 0.76, 0.80),
+            "mist_density": 0.015,
+            "sun_glow": (0.96, 0.82, 0.58, 0.80),
+            "cloud_alpha": 0.18,
+            "sun_bloom": 1.06,
+        }
+    return {
+        "mist_color": (0.72, 0.78, 0.82),
+        "mist_density": 0.014,
+        "sun_glow": (1.00, 0.90, 0.72, 0.86),
+        "cloud_alpha": 0.24,
+        "sun_bloom": 1.10,
+    }
 
 
 @dataclass
@@ -176,7 +313,7 @@ class MotionLog:
 
 
 class TerrainField:
-    def __init__(self, span_m: float = 24.0, terrain_mode: str = "grassland"):
+    def __init__(self, span_m: float = 48.0, terrain_mode: str = "grassland"):
         self.span_m = span_m
         self.terrain_mode = terrain_mode if terrain_mode in TERRAIN_PROFILES else "grassland"
 
@@ -229,7 +366,7 @@ class Rover3DPandaApp(ShowBase):
     def __init__(
         self,
         waypoints: Optional[Sequence[Waypoint3D]] = None,
-        terrain_span_m: float = 24.0,
+        terrain_span_m: float = 48.0,
         waypoint_tolerance_m: float = 0.45,
         max_speed_mps: Optional[float] = None,
         steering_gain: Optional[float] = None,
@@ -238,6 +375,8 @@ class Rover3DPandaApp(ShowBase):
         terrain_mode: str = "farmland",
         run_label: str = "demo",
         max_steps: Optional[int] = None,
+        display_resolution: Optional[Tuple[int, int] | str] = (2560, 1440),
+        target_fps: float = 90.0,
     ):
         super().__init__()
 
@@ -258,6 +397,8 @@ class Rover3DPandaApp(ShowBase):
         self.waypoints = list(waypoints or self._default_waypoints())
         self.run_label = run_label
         self.max_steps = max_steps
+        self.display_resolution = normalize_resolution(display_resolution)
+        self.target_fps = clamp_target_fps(target_fps)
         self.mission_mode = True
         self.mission_phase = "drive_to_drill"
         self.mission_hold_timer = 0.0
@@ -274,8 +415,8 @@ class Rover3DPandaApp(ShowBase):
         self.step_idx = 0
         self.finished = False
         self._quit_requested = False
-        self._camera_pos = LVector3f(self.state.x - 5.5, self.state.y - 5.5, self.state.z + 3.8)
-        self._camera_target = LVector3f(self.state.x + 2.0, self.state.y + 1.0, self.state.z + 0.2)
+        self._camera_pos = LVector3f(-25.0, -27.0, self.state.z + 18.0)
+        self._camera_target = LVector3f(0.0, 0.0, 0.0)
         self._render_frame = 0
         self._wheel_rotation = 0.0
         self._trail_points: Deque[Tuple[float, float, float]] = deque(maxlen=TRAIL_MAX_POINTS)
@@ -297,6 +438,11 @@ class Rover3DPandaApp(ShowBase):
         self._shadow_np: Optional[NodePath] = None
         self._drill_stage_np: Optional[NodePath] = None
         self._measure_stage_np: Optional[NodePath] = None
+        self._field_rows: List[NodePath] = []
+        self._grass_nodes: List[NodePath] = []
+        self._tread_nodes: List[Tuple[NodePath, float, float]] = []
+        self._route_np: Optional[NodePath] = None
+        self._camera_mode = "follow"
         self._snapshot_path: Optional[str] = None
         self._snapshot_taken = False
         self._snapshot_exit = False
@@ -307,6 +453,7 @@ class Rover3DPandaApp(ShowBase):
         self.camLens.setFov(62)
         self.camLens.setNearFar(0.15, 2000.0)
         self.setFrameRateMeter(False)
+        self._apply_display_settings()
         self._build_scene()
         self._build_hud()
         self._bind_controls()
@@ -315,11 +462,25 @@ class Rover3DPandaApp(ShowBase):
         clock = ClockObject.getGlobalClock()
         clock.setMode(ClockObject.MLimited)
         try:
-            clock.setFrameRate(120.0)
+            clock.setFrameRate(self.target_fps)
         except Exception:
             pass
 
         self.taskMgr.add(self._update_task, "rover3d-update")
+
+    def _apply_display_settings(self) -> None:
+        if self.win is None:
+            return
+
+        props = WindowProperties()
+        props.setSize(self.display_resolution[0], self.display_resolution[1])
+        props.setFullscreen(False)
+        props.setTitle(f"DIRT Panda Rover - {self.display_resolution[0]}x{self.display_resolution[1]} @ {self.target_fps:.0f} FPS")
+        try:
+            props.setMinimumSize(1280, 720)
+        except Exception:
+            pass
+        self.win.requestProperties(props)
 
     def _default_waypoints(self) -> List[Waypoint3D]:
         return [
@@ -338,6 +499,7 @@ class Rover3DPandaApp(ShowBase):
         self.accept("x", self.zero_manual_input)
         self.accept("1", self._set_auto_mode)
         self.accept("2", self._toggle_mission_mode)
+        self.accept("c", self._cycle_camera)
         self.accept("f12", self.capture_snapshot)
         for key in ["w", "a", "s", "d"]:
             self.accept(key, self._set_key, [key, True])
@@ -364,8 +526,13 @@ class Rover3DPandaApp(ShowBase):
         self._drill_cycle_complete = False
         self._measurement_complete = False
 
+    def _cycle_camera(self) -> None:
+        modes = ("follow", "overhead", "cockpit")
+        self._camera_mode = modes[(modes.index(self._camera_mode) + 1) % len(modes)]
+
     def _build_box(self, name: str, color: Tuple[float, float, float, float]) -> NodePath:
         format_ = GeomVertexFormat.getV3n3()
+        format_ = GeomVertexFormat.getV3n3c4()
         vdata = GeomVertexData(name, format_, Geom.UHStatic)
         vertex = GeomVertexWriter(vdata, "vertex")
         normal = GeomVertexWriter(vdata, "normal")
@@ -407,10 +574,11 @@ class Rover3DPandaApp(ShowBase):
         expensive trig math that used to run at the interpreter level now
         runs once, vectorized, before that loop.
         """
-        format_ = GeomVertexFormat.getV3n3c4()
+        format_ = GeomVertexFormat.getV3n3c4t2()
         vdata = GeomVertexData("terrain", format_, Geom.UHStatic)
         vertex = GeomVertexWriter(vdata, "vertex")
         normal = GeomVertexWriter(vdata, "normal")
+        texcoord = GeomVertexWriter(vdata, "texcoord")
         color = GeomVertexWriter(vdata, "color")
         tris = GeomTriangles(Geom.UHStatic)
 
@@ -429,39 +597,52 @@ class Rover3DPandaApp(ShowBase):
         ny_grid /= length_grid
         nz_grid /= length_grid
 
-        height_t_grid = np.clip((z_grid + 0.8) / 1.6, 0.0, 1.0)
+        height_t_grid = np.clip((z_grid + 0.8) / 1.7, 0.0, 1.0)
 
         gx, gy = np.meshgrid(xs, ys)
 
         if self.terrain_mode == "farmland":
-            row_band = 0.5 + 0.5 * np.sin(gy * 4.8)
-            furrow_band = 0.5 + 0.5 * np.sin((gx * 2.6 + gy * 0.2) * 2.4)
-            dirt_lane = 0.5 + 0.5 * np.sin((gx - 0.35 * gy) * 1.3)
-            band_mix = 0.58 * row_band + 0.28 * furrow_band + 0.14 * dirt_lane
+            row_band = 0.5 + 0.5 * np.sin(gy * 5.4)
+            furrow_band = 0.5 + 0.5 * np.sin((gx * 3.0 + gy * 0.24) * 2.8)
+            dirt_lane = 0.5 + 0.5 * np.sin((gx - 0.28 * gy) * 1.7)
+            band_mix = 0.56 * row_band + 0.28 * furrow_band + 0.16 * dirt_lane
 
-            base_grid = np.empty(band_mix.shape + (3,))
-            top_grid = np.empty(band_mix.shape + (3,))
-            high = band_mix > 0.62
-            mid = (band_mix > 0.42) & ~high
-            low = ~high & ~mid
-            base_grid[high] = (0.34, 0.24, 0.12)
-            top_grid[high] = (0.44, 0.58, 0.18)
-            base_grid[mid] = (0.48, 0.36, 0.16)
-            top_grid[mid] = (0.34, 0.24, 0.12)
-            base_grid[low] = (0.28, 0.22, 0.10)
-            top_grid[low] = (0.40, 0.34, 0.14)
+            low_mask = band_mix < 0.44
+            mid_mask = (band_mix >= 0.44) & (band_mix < 0.72)
+            high_mask = band_mix >= 0.72
+
+            base_grid = np.empty(z_grid.shape + (3,), dtype=float)
+            top_grid = np.empty(z_grid.shape + (3,), dtype=float)
+            base_grid[low_mask] = (0.25, 0.19, 0.11)
+            top_grid[low_mask] = (0.41, 0.32, 0.15)
+            base_grid[mid_mask] = (0.38, 0.28, 0.15)
+            top_grid[mid_mask] = (0.60, 0.50, 0.24)
+            base_grid[high_mask] = (0.30, 0.22, 0.12)
+            top_grid[high_mask] = (0.74, 0.67, 0.32)
         elif self.terrain_mode == "dunes":
-            base_grid = np.tile((0.82, 0.70, 0.40), z_grid.shape + (1,))
-            top_grid = np.tile((0.96, 0.88, 0.62), z_grid.shape + (1,))
+            base_grid = np.tile((0.60, 0.48, 0.28), z_grid.shape + (1,))
+            top_grid = np.tile((0.98, 0.84, 0.56), z_grid.shape + (1,))
         elif self.terrain_mode == "rocky":
-            base_grid = np.tile((0.36, 0.36, 0.34), z_grid.shape + (1,))
-            top_grid = np.tile((0.58, 0.54, 0.48), z_grid.shape + (1,))
+            base_grid = np.tile((0.26, 0.25, 0.24), z_grid.shape + (1,))
+            top_grid = np.tile((0.66, 0.62, 0.56), z_grid.shape + (1,))
         else:
-            base_grid = np.tile((0.32, 0.42, 0.24), z_grid.shape + (1,))
-            top_grid = np.tile((0.60, 0.58, 0.34), z_grid.shape + (1,))
+            base_grid = np.tile((0.22, 0.28, 0.18), z_grid.shape + (1,))
+            top_grid = np.tile((0.74, 0.76, 0.42), z_grid.shape + (1,))
 
         height_t_3 = height_t_grid[..., None]
         rgb_grid = base_grid * (1.0 - height_t_3) + top_grid * height_t_3
+
+        # Add a subtle warm highlight to the higher terrain values to preserve a
+        # richer field look without over-saturating the whole mesh.
+        if self.terrain_mode in {"farmland", "grassland"}:
+            rgb_grid = rgb_grid * 0.94 + np.stack(
+                [
+                    np.clip(height_t_grid * 0.18, 0.0, 1.0),
+                    np.clip(height_t_grid * 0.12, 0.0, 1.0),
+                    np.clip(height_t_grid * 0.06, 0.0, 1.0),
+                ],
+                axis=-1,
+            )
 
         index_grid: List[List[int]] = []
         index = 0
@@ -470,6 +651,7 @@ class Rover3DPandaApp(ShowBase):
             for col in range(resolution):
                 vertex.addData3f(float(gx[row, col]), float(gy[row, col]), float(z_grid[row, col]))
                 normal.addData3f(float(nx_grid[row, col]), float(ny_grid[row, col]), float(nz_grid[row, col]))
+                texcoord.addData2f(float(gx[row, col] / 3.2), float(gy[row, col] / 3.2))
                 r, g, b = rgb_grid[row, col]
                 color.addData4f(float(r), float(g), float(b), 1.0)
                 row_indices.append(index)
@@ -491,6 +673,7 @@ class Rover3DPandaApp(ShowBase):
         node.addGeom(geom)
         terrain_np = self.render.attachNewNode(node)
         terrain_np.setTwoSided(True)
+        terrain_np.setTexture(self._make_grass_texture(), 1)
         return terrain_np
 
     def _build_waypoint_marker(self, colour: Tuple[float, float, float, float]) -> NodePath:
@@ -561,6 +744,37 @@ class Rover3DPandaApp(ShowBase):
         texture.load(image)
         texture.setMagfilter(Texture.FTLinear)
         texture.setMinfilter(Texture.FTLinearMipmapLinear)
+        return texture
+
+    def _make_grass_texture(self) -> Texture:
+        """Create a small tiled grass and soil map without an external asset."""
+        size = 256
+        rng = np.random.default_rng(17)
+        noise = rng.random((size, size))
+        coarse = rng.random((32, 32))
+        coarse = np.repeat(np.repeat(coarse, 8, axis=0), 8, axis=1)
+        green = np.clip(0.58 + noise * 0.18 + coarse * 0.16, 0.0, 1.0)
+        soil = noise > 0.965
+        blade = noise < 0.035
+
+        image = PNMImage(size, size, 3)
+        for y in range(size):
+            for x in range(size):
+                value = green[y, x]
+                if soil[y, x]:
+                    rgb = (0.24 + value * 0.10, 0.19 + value * 0.08, 0.08 + value * 0.04)
+                elif blade[y, x]:
+                    rgb = (0.18 + value * 0.10, 0.34 + value * 0.18, 0.08 + value * 0.05)
+                else:
+                    rgb = (0.25 + value * 0.14, 0.42 + value * 0.20, 0.10 + value * 0.06)
+                image.setXel(x, y, *rgb)
+
+        texture = Texture("grass-map")
+        texture.load(image)
+        texture.setWrapU(Texture.WMRepeat)
+        texture.setWrapV(Texture.WMRepeat)
+        texture.setMinfilter(Texture.FTLinearMipmapLinear)
+        texture.setMagfilter(Texture.FTLinear)
         return texture
 
     def _make_billboard_sprite(
@@ -827,6 +1041,43 @@ class Rover3DPandaApp(ShowBase):
             rear_leg.setPos(-0.78, 0.0, -0.12)
             self._apply_material(rear_leg, (0.18, 0.20, 0.24, 1.0), (0.06, 0.07, 0.08, 1.0), (0.32, 0.36, 0.40, 1.0), 20.0)
 
+            track_material = ((0.06, 0.07, 0.08, 1.0), (0.02, 0.02, 0.03, 1.0), (0.14, 0.16, 0.18, 1.0))
+            track_top = self._build_box(f"track-top-{side_name}", (0.06, 0.07, 0.08, 1.0))
+            track_top.reparentTo(suspension)
+            track_top.setScale(1.92, 0.32, 0.12)
+            track_top.setPos(0.0, 0.0, 0.40)
+            self._apply_material(track_top, *track_material, 8.0)
+
+            track_bottom = self._build_box(f"track-bottom-{side_name}", (0.06, 0.07, 0.08, 1.0))
+            track_bottom.reparentTo(suspension)
+            track_bottom.setScale(1.92, 0.32, 0.12)
+            track_bottom.setPos(0.0, 0.0, -0.48)
+            self._apply_material(track_bottom, *track_material, 8.0)
+
+            for track_end, x_pos in (("front", 0.96), ("rear", -0.96)):
+                end_plate = self._build_box(f"track-end-{side_name}-{track_end}", (0.06, 0.07, 0.08, 1.0))
+                end_plate.reparentTo(suspension)
+                end_plate.setScale(0.12, 0.32, 0.44)
+                end_plate.setPos(x_pos, 0.0, -0.04)
+                self._apply_material(end_plate, *track_material, 8.0)
+
+            for plate_index, x_pos in enumerate(np.linspace(-0.78, 0.78, 7)):
+                track_plate = self._build_box(f"track-plate-{side_name}-{plate_index}", (0.12, 0.13, 0.14, 1.0))
+                track_plate.reparentTo(suspension)
+                track_plate.setScale(0.09, 0.36, 0.055)
+                track_plate.setPos(x_pos, 0.0, 0.47)
+                track_plate.setHpr(0.0, 0.0, 90.0 if plate_index % 2 else 0.0)
+                self._apply_material(track_plate, (0.12, 0.13, 0.14, 1.0), (0.04, 0.04, 0.05, 1.0), (0.22, 0.24, 0.26, 1.0), 10.0)
+                self._tread_nodes.append((track_plate, float(x_pos), 0.0))
+
+                lower_plate = self._build_box(f"track-lower-plate-{side_name}-{plate_index}", (0.10, 0.11, 0.12, 1.0))
+                lower_plate.reparentTo(suspension)
+                lower_plate.setScale(0.09, 0.36, 0.055)
+                lower_plate.setPos(x_pos, 0.0, -0.55)
+                lower_plate.setHpr(0.0, 0.0, 90.0 if plate_index % 2 else 0.0)
+                self._apply_material(lower_plate, (0.10, 0.11, 0.12, 1.0), (0.03, 0.03, 0.04, 1.0), (0.18, 0.20, 0.22, 1.0), 8.0)
+                self._tread_nodes.append((lower_plate, float(x_pos), 1.0))
+
             wheel_positions = [(0.82, "front"), (0.00, "middle"), (-0.82, "rear")]
             for x_pos, label in wheel_positions:
                 wheel_outer = self._build_box(f"wheel-{side_name}-{label}", (0.10, 0.10, 0.12, 1.0))
@@ -948,11 +1199,47 @@ class Rover3DPandaApp(ShowBase):
         self.rover_np = self._build_rover()
         self.waypoint_nodes: List[NodePath] = []
 
-        sun_texture = self._make_soft_disc_texture("sun", (1.0, 0.80, 0.42), (1.0, 0.64, 0.18, 0.0))
+        for index, y in enumerate(np.linspace(-21.0, 21.0, 17)):
+            row = self._build_box(f"field-row-{index}", (0.44, 0.35, 0.18, 1.0))
+            row.reparentTo(self.render)
+            row.setScale(43.0, 0.18, 0.10)
+            row.setPos(0.0, y, self.terrain.height(0.0, y) + 0.09)
+            row.setColor((0.48 + 0.02 * index, 0.43 + 0.01 * index, 0.28, 1.0))
+            self._field_rows.append(row)
+
+            for tuft_index, x in enumerate(np.linspace(-20.0, 20.0, 9)):
+                tuft = self._build_box(f"grass-tuft-{index}-{tuft_index}", (0.18, 0.42, 0.10, 1.0))
+                tuft.reparentTo(self.render)
+                tuft.setScale(0.045, 0.045, 0.22 + 0.04 * ((index + tuft_index) % 3))
+                tuft.setPos(x + (0.8 if index % 2 else -0.8), y + 0.34, self.terrain.height(x, y + 0.34) + 0.16)
+                tuft.setHpr(-10.0 + (tuft_index % 3) * 8.0, 0.0, -18.0 + index * 3.0)
+                tuft.setColor((0.18 + 0.02 * (index % 3), 0.42 + 0.03 * (tuft_index % 3), 0.10, 1.0))
+                self._grass_nodes.append(tuft)
+
+        for n in range(16):
+            fence_post = self._build_box(f"fence-post-{n}", (0.62, 0.52, 0.34, 1.0))
+            fence_post.reparentTo(self.render)
+            fence_post.setScale(0.12, 0.12, 1.0)
+            x = -22.5 + n * 3.0
+            fence_post.setPos(x, -22.4, self.terrain.height(x, -22.4) + 0.55)
+
+        for n in range(16):
+            fence_post = self._build_box(f"fence-post-2-{n}", (0.62, 0.52, 0.34, 1.0))
+            fence_post.reparentTo(self.render)
+            fence_post.setScale(0.12, 0.12, 1.0)
+            y = -22.0 + n * 3.0
+            fence_post.setPos(-22.4, y, self.terrain.height(-22.4, y) + 0.55)
+
+        weather = weather_profile(self.terrain_mode)
+        sun_texture = self._make_soft_disc_texture(
+            "sun",
+            (weather["sun_glow"][0], weather["sun_glow"][1], weather["sun_glow"][2]),
+            (weather["sun_glow"][0], weather["sun_glow"][1], weather["sun_glow"][2], 0.0),
+        )
         self._sun_np = self._make_billboard_sprite(
             "sun-disc",
             sun_texture,
-            18.0,
+            22.0,
             (22.0, 30.0, 82.0),
             (1.0, 0.94, 0.76, 0.80),
         )
@@ -962,9 +1249,9 @@ class Rover3DPandaApp(ShowBase):
             cloud = self._make_billboard_sprite(
                 f"cloud-{index}",
                 cloud_texture,
-                12.0 + index * 2.5,
+                18.0 + index * 3.5,
                 cloud_pos,
-                (1.0, 1.0, 1.0, 0.28),
+                (1.0, 1.0, 1.0, weather["cloud_alpha"]),
             )
             cloud.setDepthWrite(False)
             self._cloud_nodes.append(cloud)
@@ -975,6 +1262,16 @@ class Rover3DPandaApp(ShowBase):
             marker.setPos(waypoint.x, waypoint.y, self.terrain.height(waypoint.x, waypoint.y) + 0.45)
             self.waypoint_nodes.append(marker)
 
+        if len(self.waypoints) >= 2:
+            route = LineSegs("mission-route")
+            route.setThickness(2.5)
+            route.setColor(0.18, 0.92, 0.72, 0.72)
+            first = self.waypoints[0]
+            route.moveTo(first.x, first.y, self.terrain.height(first.x, first.y) + 0.16)
+            for waypoint in self.waypoints[1:]:
+                route.drawTo(waypoint.x, waypoint.y, self.terrain.height(waypoint.x, waypoint.y) + 0.16)
+            self._route_np = self.render.attachNewNode(route.create())
+
         self._spawn_field_obstacles()
 
     def _spawn_field_obstacles(self) -> None:
@@ -982,6 +1279,14 @@ class Rover3DPandaApp(ShowBase):
             ("tree-1", "tree", -4.5, -0.5, 0.95),
             ("tree-2", "tree", 2.8, 4.0, 1.05),
             ("tree-3", "tree", 6.8, -3.8, 0.90),
+            ("tree-4", "tree", -18.0, -15.0, 1.25),
+            ("tree-5", "tree", -14.0, 14.0, 1.10),
+            ("tree-6", "tree", -2.0, 18.0, 1.35),
+            ("tree-7", "tree", 11.0, 17.0, 1.20),
+            ("tree-8", "tree", 19.0, 10.0, 1.30),
+            ("tree-9", "tree", 18.0, -12.0, 1.15),
+            ("tree-10", "tree", -18.0, 7.0, 1.05),
+            ("tree-11", "tree", 12.0, -20.0, 1.30),
             ("rock-1", "rock", -1.2, 2.8, 0.55),
             ("rock-2", "rock", 4.9, -1.6, 0.45),
             ("rock-3", "rock", -6.2, 5.2, 0.60),
@@ -1003,27 +1308,32 @@ class Rover3DPandaApp(ShowBase):
 
         trunk = self._build_box(f"{name}-trunk", (0.42, 0.28, 0.12, 1.0))
         trunk.reparentTo(root)
-        trunk.setScale(0.12 * scale, 0.12 * scale, 0.65 * scale)
+        trunk.setScale(0.14 * scale, 0.14 * scale, 0.72 * scale)
         trunk.setPos(0.0, 0.0, 0.32 * scale)
+        trunk.setHpr(-3.0, 0.0, 4.0)
         self._apply_material(trunk, (0.40, 0.26, 0.12, 1.0), (0.16, 0.10, 0.05, 1.0), (0.52, 0.34, 0.18, 1.0), 10.0)
 
-        canopy_a = self._build_box(f"{name}-canopy-a", (0.14, 0.42, 0.12, 1.0))
-        canopy_a.reparentTo(root)
-        canopy_a.setScale(0.34 * scale, 0.34 * scale, 0.30 * scale)
-        canopy_a.setPos(0.0, 0.0, 0.94 * scale)
-        self._apply_material(canopy_a, (0.18, 0.46, 0.16, 1.0), (0.08, 0.18, 0.08, 1.0), (0.36, 0.66, 0.28, 1.0), 18.0)
+        for side, x, z, rotation in (("left", -0.22, 0.78, -18.0), ("right", 0.20, 0.82, 20.0)):
+            branch = self._build_box(f"{name}-branch-{side}", (0.30, 0.20, 0.10, 1.0))
+            branch.reparentTo(root)
+            branch.setScale(0.40 * scale, 0.07 * scale, 0.07 * scale)
+            branch.setPos(x * scale, 0.0, z * scale)
+            branch.setHpr(0.0, 0.0, rotation)
+            self._apply_material(branch, (0.34, 0.20, 0.08, 1.0), (0.12, 0.07, 0.03, 1.0), (0.44, 0.26, 0.10, 1.0), 8.0)
 
-        canopy_b = self._build_box(f"{name}-canopy-b", (0.16, 0.48, 0.14, 1.0))
-        canopy_b.reparentTo(root)
-        canopy_b.setScale(0.26 * scale, 0.26 * scale, 0.24 * scale)
-        canopy_b.setPos(0.18 * scale, -0.06 * scale, 1.08 * scale)
-        self._apply_material(canopy_b, (0.18, 0.50, 0.16, 1.0), (0.08, 0.18, 0.08, 1.0), (0.36, 0.72, 0.28, 1.0), 18.0)
-
-        canopy_c = self._build_box(f"{name}-canopy-c", (0.16, 0.48, 0.14, 1.0))
-        canopy_c.reparentTo(root)
-        canopy_c.setScale(0.22 * scale, 0.22 * scale, 0.22 * scale)
-        canopy_c.setPos(-0.16 * scale, 0.10 * scale, 1.00 * scale)
-        self._apply_material(canopy_c, (0.18, 0.50, 0.16, 1.0), (0.08, 0.18, 0.08, 1.0), (0.36, 0.72, 0.28, 1.0), 18.0)
+        foliage = [
+            ("lower", 0.42, 0.34, 0.25, -0.02, 0.0, 0.90, (0.12, 0.34, 0.10, 1.0)),
+            ("left", 0.30, 0.28, 0.25, -0.28, 0.02, 1.08, (0.16, 0.46, 0.14, 1.0)),
+            ("right", 0.31, 0.27, 0.24, 0.27, -0.04, 1.10, (0.20, 0.52, 0.16, 1.0)),
+            ("top", 0.25, 0.24, 0.24, 0.02, 0.04, 1.30, (0.26, 0.58, 0.18, 1.0)),
+        ]
+        for part, sx, sy, sz, x, y, z, diffuse in foliage:
+            canopy = self._build_box(f"{name}-canopy-{part}", diffuse)
+            canopy.reparentTo(root)
+            canopy.setScale(sx * scale, sy * scale, sz * scale)
+            canopy.setPos(x * scale, y * scale, z * scale)
+            canopy.setHpr((x + y) * 18.0, y * 12.0, x * 20.0)
+            self._apply_material(canopy, diffuse, (diffuse[0] * 0.42, diffuse[1] * 0.42, diffuse[2] * 0.42, 1.0), (diffuse[0] * 1.3, diffuse[1] * 1.3, diffuse[2] * 1.3, 1.0), 20.0)
 
         return root
 
@@ -1055,30 +1365,31 @@ class Rover3DPandaApp(ShowBase):
 
     def _setup_lights(self) -> None:
         self.render.setShaderAuto()
+        profile = lighting_profile(self.terrain_mode)
 
         fog = Fog("atmosphere")
-        fog.setColor(0.56, 0.70, 0.74)
-        fog.setExpDensity(0.010)
+        fog.setColor(profile["fog_color"][0], profile["fog_color"][1], profile["fog_color"][2])
+        fog.setExpDensity(profile["fog_density"])
         self.render.setFog(fog)
 
         ambient = AmbientLight("ambient")
-        ambient.setColor((0.32, 0.34, 0.38, 1.0))
+        ambient.setColor(profile["ambient"])
         ambient_np = self.render.attachNewNode(ambient)
         self.render.setLight(ambient_np)
 
         key_light = DirectionalLight("sun")
-        key_light.setColor((1.00, 0.93, 0.80, 1.0))
+        key_light.setColor(profile["sun_color"])
         key_np = self.render.attachNewNode(key_light)
-        key_np.setHpr(-35, -55, 0)
+        key_np.setHpr(-35, -62, 0)
         self.render.setLight(key_np)
 
         fill_light = DirectionalLight("fill")
-        fill_light.setColor((0.22, 0.30, 0.42, 1.0))
+        fill_light.setColor(profile["fill_color"])
         fill_np = self.render.attachNewNode(fill_light)
-        fill_np.setHpr(145, -22, 0)
+        fill_np.setHpr(145, -26, 0)
         self.render.setLight(fill_np)
 
-        self.setBackgroundColor(0.54, 0.68, 0.74, 1.0)
+        self.setBackgroundColor(*profile["background"])
 
     def _build_hud(self) -> None:
         self.hud = OnscreenText(
@@ -1092,7 +1403,7 @@ class Rover3DPandaApp(ShowBase):
             shadow=(0.05, 0.05, 0.05, 0.9),
         )
         self.help = OnscreenText(
-            text="W/S throttle   A/D steer   M manual   Space pause   R reset   X zero input   1 auto   Q quit",
+            text="W/S throttle   A/D steer   M manual   C camera   Space pause   R reset   X zero input   1 auto   Q quit",
             parent=self.a2dBottomLeft,
             align=TextNode.ALeft,
             pos=(0.05, 0.06),
@@ -1379,18 +1690,34 @@ class Rover3DPandaApp(ShowBase):
         self.rover_np.setR(self.state.roll_deg)
 
         cam_heading = math.radians(self.state.heading_deg)
-        desired_eye = LVector3f(
-            self.state.x - math.cos(cam_heading) * (5.2 + min(2.0, max(0.0, self.state.speed * 0.75))),
-            self.state.y - math.sin(cam_heading) * (5.2 + min(2.0, max(0.0, self.state.speed * 0.75))),
-            self.state.z + 3.2 + min(1.4, max(0.0, self.state.speed * 0.2)),
-        )
-        desired_target = LVector3f(
-            self.state.x + math.cos(cam_heading) * 1.8,
-            self.state.y + math.sin(cam_heading) * 1.8,
-            self.state.z + 0.25 + 0.10 * math.sin(math.radians(self.state.pitch_deg)),
-        )
-
-        alpha = 0.18 if self._render_frame == 0 else 0.12
+        if self._camera_mode == "overhead":
+            desired_eye = LVector3f(self.state.x, self.state.y - 0.5, self.state.z + 22.0)
+            desired_target = LVector3f(self.state.x, self.state.y, self.state.z)
+        elif self._camera_mode == "cockpit":
+            desired_eye = LVector3f(
+                self.state.x + math.cos(cam_heading) * 0.65,
+                self.state.y + math.sin(cam_heading) * 0.65,
+                self.state.z + 1.65,
+            )
+            desired_target = LVector3f(
+                self.state.x + math.cos(cam_heading) * 7.0,
+                self.state.y + math.sin(cam_heading) * 7.0,
+                self.state.z + 1.15,
+            )
+        else:
+            camera_distance = 10.0
+            desired_eye = LVector3f(
+                self.state.x - math.cos(cam_heading) * camera_distance + math.sin(cam_heading) * 3.0,
+                self.state.y - math.sin(cam_heading) * camera_distance - math.cos(cam_heading) * 3.0,
+                self.state.z + 8.5,
+            )
+            desired_target = LVector3f(
+                self.state.x + math.cos(cam_heading) * 1.5,
+                self.state.y + math.sin(cam_heading) * 1.5,
+                self.state.z + 0.5,
+            )
+        self.camLens.setFov(64.0)
+        alpha = 0.12 if self._render_frame else 1.0
         self._camera_pos = LVector3f(
             _lerp(self._camera_pos.x, desired_eye.x, alpha),
             _lerp(self._camera_pos.y, desired_eye.y, alpha),
@@ -1404,12 +1731,25 @@ class Rover3DPandaApp(ShowBase):
         self.camera.setPos(self._camera_pos)
         self.camera.lookAt(self._camera_target)
 
+        tread_phase = (self._wheel_rotation * 0.08) % 1.8
+        for tread, base_x, direction in self._tread_nodes:
+            offset = ((tread_phase * (-1.0 if direction else 1.0) + base_x + 0.9) % 1.8) - 0.9
+            tread.setX(offset)
+
+        for index, tuft in enumerate(self._grass_nodes):
+            tuft.setR(-18.0 + 7.0 * math.sin(self._render_frame * 0.025 + index * 0.7))
+
         if self._sky_np is not None:
             self._sky_np.setPos(self.state.x, self.state.y, self.state.z - 6.0)
         if self._sun_np is not None:
             self._sun_np.setPos(self.state.x + 26.0, self.state.y + 34.0, self.state.z + 72.0)
+        cloud_drift = self._render_frame * 0.012
         for idx, cloud in enumerate(self._cloud_nodes):
-            cloud.setPos(self.state.x + (-24.0 + idx * 18.0), self.state.y + (20.0 - idx * 8.0), self.state.z + (68.0 + idx * 3.0))
+            cloud.setPos(
+                self.state.x + (-24.0 + idx * 18.0) + cloud_drift,
+                self.state.y + (20.0 - idx * 8.0),
+                self.state.z + (24.0 + idx * 3.0),
+            )
         if self._shadow_np is not None:
             self._shadow_np.setPos(self.state.x + 0.12, self.state.y - 0.06, self.terrain.height(self.state.x, self.state.y) + 0.012)
             self._shadow_np.setScale(1.2 + self.state.speed * 0.18, 1.0 + self.state.speed * 0.10, 1.0)
@@ -1450,7 +1790,8 @@ class Rover3DPandaApp(ShowBase):
             f"Heading: {self.state.heading_deg:+.1f} deg  Speed: {self.state.speed:.2f} m/s\n"
             f"Mode: {'manual' if self.manual_mode else self.control_mode}  Terrain: {self.terrain_mode}\n"
             f"Obstacle: {self._nearest_obstacle_text}  Detected: {len(self._detected_obstacles)}\n"
-            f"Mission: {'on' if self.mission_mode else 'off'}  Phase: {self.mission_phase}\n"
+            f"Mission: {'on' if self.mission_mode else 'off'}  Phase: {self.mission_phase}  Route: {min(self.target_idx, len(self.waypoints))}/{len(self.waypoints)}\n"
+            f"Camera: {self._camera_mode}  Tread speed: {self._wheel_rotation % 360.0:.0f} deg\n"
             f"Drill lift: {self._drill_lift:.2f}  Measure lift: {self._measure_lift:.2f}  pitch {self.state.pitch_deg:+.1f} deg  roll {self.state.roll_deg:+.1f} deg"
         )
 
@@ -1474,15 +1815,36 @@ class Rover3DPandaApp(ShowBase):
             return
 
         self._trail_rebuild()
-        segs = LineSegs("trail")
-        segs.setThickness(4.0)
-        segs.setColor(1.0, 0.58, 0.10, 1.0)
+        left_track = LineSegs("left-tire-track")
+        right_track = LineSegs("right-tire-track")
+        left_track.setThickness(3.0)
+        right_track.setThickness(3.0)
+        left_track.setColor(0.16, 0.10, 0.05, 0.75)
+        right_track.setColor(0.16, 0.10, 0.05, 0.75)
         points = list(self._trail_points)
+        offsets = []
+        for point_index, point in enumerate(points):
+            reference = points[min(point_index + 1, len(points) - 1)]
+            if reference == point and point_index > 0:
+                reference = points[point_index - 1]
+            tangent = math.atan2(reference[1] - point[1], reference[0] - point[0])
+            side_x = -math.sin(tangent) * 0.34
+            side_y = math.cos(tangent) * 0.34
+            offsets.append((side_x, side_y))
+
         first = points[0]
-        segs.moveTo(first[0], first[1], first[2] + 0.06)
-        for point in points[1:]:
-            segs.drawTo(point[0], point[1], point[2] + 0.06)
-        self._trail_np = self.render.attachNewNode(segs.create())
+        first_offset = offsets[0]
+        left_track.moveTo(first[0] + first_offset[0], first[1] + first_offset[1], first[2] + 0.07)
+        right_track.moveTo(first[0] - first_offset[0], first[1] - first_offset[1], first[2] + 0.07)
+        for point, (side_x, side_y) in zip(points[1:], offsets[1:]):
+            left_track.drawTo(point[0] + side_x, point[1] + side_y, point[2] + 0.07)
+            right_track.drawTo(point[0] - side_x, point[1] - side_y, point[2] + 0.07)
+        trail_root = self.render.attachNewNode("tire-tracks")
+        self._trail_np = trail_root
+        left_track_node = trail_root.attachNewNode(left_track.create())
+        right_track_node = trail_root.attachNewNode(right_track.create())
+        left_track_node.setDepthOffset(2)
+        right_track_node.setDepthOffset(2)
         self._trail_dirty = False
 
     def _update_task(self, task):
@@ -1579,6 +1941,7 @@ def run_rover_3d_demo(
     if not show_video:
         log.info("Panda3D backend requires a GUI window; continuing with the interactive renderer.")
 
+    normalized_resolution = normalize_resolution(display_resolution)
     app = Rover3DPandaApp(
         waypoints=waypoints,
         waypoint_tolerance_m=waypoint_tolerance_m,
@@ -1586,6 +1949,8 @@ def run_rover_3d_demo(
         terrain_mode=terrain_mode,
         run_label=run_label,
         max_steps=max_steps,
+        display_resolution=normalized_resolution,
+        target_fps=clamp_target_fps(target_fps),
     )
     app.manual_mode = start_manual
     app._snapshot_path = snapshot_path
@@ -1595,7 +1960,7 @@ def run_rover_3d_demo(
         log.info("Simulation end condition: mission complete or user quit")
     else:
         log.info("Simulation end condition: max_steps=%d, mission complete, or user quit", max_steps)
-    log.info("Display size hint: %sx%s | target FPS: %.1f | legacy delay: %sms", display_resolution[0], display_resolution[1], target_fps, delay_ms)
+    log.info("Display size: %sx%s | target FPS: %.1f | legacy delay: %sms", normalized_resolution[0], normalized_resolution[1], app.target_fps, delay_ms)
 
     try:
         if snapshot_path and not snapshot_exit:

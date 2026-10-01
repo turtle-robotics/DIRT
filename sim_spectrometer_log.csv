@@ -1,0 +1,10 @@
+step,run_label,soil_type,soil_moisture_pct,organic_matter_pct,iron_oxide_idx,spectrometer_confidence,spectrometer_temp_c
+0,demo,loam,24.5,3.0,0.284,0.781,24.96
+1,demo,loam,24.5,3.0,0.297,0.783,24.45
+2,demo,loam,23.1,3.0,0.304,0.776,25.5
+3,demo,loam,21.5,3.1,0.332,0.762,24.0
+4,demo,loam,27.1,3.1,0.329,0.579,25.05
+5,demo,loam,22.6,3.4,0.327,0.736,24.67
+6,demo,loam,30.7,3.0,0.323,0.753,24.29
+7,demo,loam,23.7,3.7,0.326,0.739,25.04
+8,demo,loam,23.2,3.3,0.315,0.656,25.7
