@@ -39,6 +39,7 @@ from panda3d.core import (
     LineSegs,
     Material,
     NodePath,
+    Point3,
     PNMImage,
     Texture,
     TextNode,
@@ -500,6 +501,7 @@ class Rover3DPandaApp(ShowBase):
         self.accept("1", self._set_auto_mode)
         self.accept("2", self._toggle_mission_mode)
         self.accept("c", self._cycle_camera)
+        self.accept("mouse1", self._place_waypoint)
         self.accept("f12", self.capture_snapshot)
         for key in ["w", "a", "s", "d"]:
             self.accept(key, self._set_key, [key, True])
@@ -529,6 +531,60 @@ class Rover3DPandaApp(ShowBase):
     def _cycle_camera(self) -> None:
         modes = ("follow", "overhead", "cockpit")
         self._camera_mode = modes[(modes.index(self._camera_mode) + 1) % len(modes)]
+
+    def _place_waypoint(self) -> None:
+        if not self.mouseWatcherNode.hasMouse():
+            return
+
+        mouse = self.mouseWatcherNode.getMouse()
+        ray_start = Point3()
+        ray_end = Point3()
+        if not self.camLens.extrude(mouse, ray_start, ray_end):
+            return
+
+        world_start = self.render.getRelativePoint(self.camera, ray_start)
+        world_end = self.render.getRelativePoint(self.camera, ray_end)
+        direction = world_end - world_start
+        if abs(direction.z) < 1e-6:
+            return
+
+        t = -world_start.z / direction.z
+        if t <= 0.0:
+            return
+
+        x = float(world_start.x + direction.x * t)
+        y = float(world_start.y + direction.y * t)
+        half = self.terrain.span_m / 2.0 - 0.5
+        if not (-half <= x <= half and -half <= y <= half):
+            return
+
+        waypoint = Waypoint3D(f"Field {len(self.waypoints)}", x, y)
+        self.waypoints.append(waypoint)
+        self._rebuild_waypoint_visuals()
+
+    def _rebuild_waypoint_visuals(self) -> None:
+        for marker in self.waypoint_nodes:
+            marker.removeNode()
+        self.waypoint_nodes.clear()
+        if self._route_np is not None:
+            self._route_np.removeNode()
+            self._route_np = None
+
+        for idx, waypoint in enumerate(self.waypoints):
+            marker = self._build_waypoint_marker(self._waypoint_colour(idx))
+            marker.reparentTo(self.render)
+            marker.setPos(waypoint.x, waypoint.y, self.terrain.height(waypoint.x, waypoint.y) + 0.45)
+            self.waypoint_nodes.append(marker)
+
+        if len(self.waypoints) >= 2:
+            route = LineSegs("mission-route")
+            route.setThickness(2.5)
+            route.setColor(0.18, 0.92, 0.72, 0.72)
+            first = self.waypoints[0]
+            route.moveTo(first.x, first.y, self.terrain.height(first.x, first.y) + 0.16)
+            for waypoint in self.waypoints[1:]:
+                route.drawTo(waypoint.x, waypoint.y, self.terrain.height(waypoint.x, waypoint.y) + 0.16)
+            self._route_np = self.render.attachNewNode(route.create())
 
     def _build_box(self, name: str, color: Tuple[float, float, float, float]) -> NodePath:
         format_ = GeomVertexFormat.getV3n3()
@@ -1403,7 +1459,7 @@ class Rover3DPandaApp(ShowBase):
             shadow=(0.05, 0.05, 0.05, 0.9),
         )
         self.help = OnscreenText(
-            text="W/S throttle   A/D steer   M manual   C camera   Space pause   R reset   X zero input   1 auto   Q quit",
+            text="Click add waypoint   W/S throttle   A/D steer   M manual   C camera   Space pause   R reset   X zero input   1 auto   Q quit",
             parent=self.a2dBottomLeft,
             align=TextNode.ALeft,
             pos=(0.05, 0.06),
@@ -1519,6 +1575,17 @@ class Rover3DPandaApp(ShowBase):
         distance = math.hypot(dx, dy)
         desired_heading = math.degrees(math.atan2(dy, dx))
         heading_error = _wrap_angle_deg(desired_heading - self.state.heading_deg)
+
+        for _name, _obstacle_np, obstacle_x, obstacle_y, _scale in self._obstacle_nodes:
+            obstacle_dx = obstacle_x - self.state.x
+            obstacle_dy = obstacle_y - self.state.y
+            obstacle_distance = math.hypot(obstacle_dx, obstacle_dy)
+            obstacle_bearing = _wrap_angle_deg(math.degrees(math.atan2(obstacle_dy, obstacle_dx)) - self.state.heading_deg)
+            if obstacle_distance < 3.8 and abs(obstacle_bearing) < 58.0:
+                avoidance_strength = _clamp((3.8 - obstacle_distance) / 2.8, 0.0, 1.0)
+                avoidance_sign = -1.0 if obstacle_bearing >= 0.0 else 1.0
+                heading_error += avoidance_sign * 52.0 * avoidance_strength
+
         slope_x, slope_y = self.terrain.gradient(self.state.x, self.state.y)
         slope_mag = math.hypot(slope_x, slope_y)
 
