@@ -253,6 +253,23 @@ input[type=text]{flex:1;min-width:0;height:56px;border:1.5px solid var(--line);b
 .bm:focus-visible{outline:3px solid #f4efe4;outline-offset:3px}
 .count{grid-column:1/-1;margin:0;font-family:var(--f-mono);font-size:11px;color:#a59d8e;min-height:16px}
 
+/* showcase caption band */
+.tour{position:fixed;z-index:16;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));width:min(680px,calc(100% - 32px));background:var(--panel);border:1.5px solid var(--accent);padding:14px 18px 12px;display:grid;gap:4px;clip-path:polygon(0 0,calc(100% - 14px) 0,100% 14px,100% 100%,0 100%);box-shadow:0 10px 30px #0006}
+.tour .meta{display:flex;justify-content:space-between;gap:10px;font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent)}
+.tour h2{margin:0;font-family:var(--f-display);font-weight:800;font-size:30px;line-height:1;letter-spacing:.04em;text-transform:uppercase;text-wrap:balance}
+.tour p{margin:0;font-size:15px}
+.tour .bar{height:4px;background:var(--panel-2);margin-top:6px}
+.tour .bar i{display:block;height:100%;width:0;background:var(--accent)}
+.tour .hint{font-family:var(--f-mono);font-size:10px;color:var(--ink-dim)}
+body.touring main{padding-bottom:200px}
+.seg.wrap3{display:grid;grid-template-columns:repeat(3,1fr)}
+.phone{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+.phone .qr{background:#fff;padding:8px;line-height:0;flex:none}
+.phone .qr:empty{display:none}
+.phone .qr img,.phone .qr canvas{width:132px;height:132px}
+.phone .urls{display:grid;gap:6px;min-width:0;flex:1}
+.phone .urls code{font-size:13px;word-break:break-all}
+
 @media (max-width:900px){.batt small{display:none}}
 /* phones / portrait screens */
 @media (max-width:640px){
@@ -270,6 +287,8 @@ input[type=text]{flex:1;min-width:0;height:56px;border:1.5px solid var(--line);b
   .boot-inner > div{width:100%}
   .mark img{width:118px}
   .bigname{font-size:80px}
+  .tour{bottom:calc(86px + env(safe-area-inset-bottom,0px))}
+  .tour h2{font-size:24px}
 }
 </style>
 
@@ -465,6 +484,14 @@ input[type=text]{flex:1;min-width:0;height:56px;border:1.5px solid var(--line);b
 </div>
 <div class="alarmframe" aria-hidden="true"></div>
 
+<div class="tour" id="tour" hidden aria-live="polite">
+  <div class="meta"><span id="tourStep"></span><span id="tourTerrain"></span></div>
+  <h2 id="tourTitle"></h2>
+  <p id="tourText"></p>
+  <div class="bar"><i id="tourBar"></i></div>
+  <span class="hint">Touch anywhere to explore. The loop resumes after 60 s.</span>
+</div>
+
 <div class="sheet" id="settings" hidden role="dialog" aria-modal="true" aria-labelledby="setTitle">
   <div class="sheet-panel">
     <div class="vhead"><h1 id="setTitle">Settings</h1><div class="spacer"></div><button class="iconbtn" data-act="close" aria-label="Close settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button></div>
@@ -490,6 +517,19 @@ input[type=text]{flex:1;min-width:0;height:56px;border:1.5px solid var(--line);b
       <div class="seg" data-seg="sound"><button data-v="on">On</button><button data-v="off">Off</button></div>
     </div>
     <div class="field">
+      <span class="label">Demo terrain (same maps as the Panda3D sim)</span>
+      <div class="seg wrap3" data-seg="terrain"><button data-v="farmland">Farmland</button><button data-v="grassland">Grassland</button><button data-v="rolling">Rolling</button><button data-v="dunes">Dunes</button><button data-v="rocky">Rocky</button><button data-v="testyard">Test yard</button></div>
+    </div>
+    <div class="field">
+      <span class="label">Showcase loop</span>
+      <div class="seg" data-seg="showcase"><button data-v="on">On</button><button data-v="off">Off</button></div>
+      <p class="sub">Cycles through every view with captions for visitors. A touch pauses it for 60 s.</p>
+    </div>
+    <div class="field">
+      <span class="label">Open on a phone</span>
+      <div class="phone"><div class="qr" id="qr"></div><div class="urls" id="phoneUrls"></div></div>
+    </div>
+    <div class="field">
       <span class="label">ROS 2 topics this screen uses</span>
       <div class="topics" id="topicList"></div>
     </div>
@@ -508,7 +548,8 @@ input[type=text]{flex:1;min-width:0;height:56px;border:1.5px solid var(--line);b
     </div>
     <div class="menu">
       <button class="bm" data-boot="live"><span>Start rover display</span><small id="bmLiveSub">Live data from the rover</small></button>
-      <button class="bm" data-boot="demo"><span>Demo mode</span><small>Simulated readings for showing people</small></button>
+      <button class="bm" data-boot="demo"><span>Demo mode</span><small>Simulated rover on the sim's terrain maps</small></button>
+      <button class="bm" data-boot="showcase"><span>Showcase</span><small>Guided loop for visitors and PDR</small></button>
       <button class="bm" data-boot="settings"><span>Settings</span><small>Rover address, units, screen</small></button>
     </div>
     <p class="count" id="bootCount" aria-live="polite"></p>
@@ -516,6 +557,7 @@ input[type=text]{flex:1;min-width:0;height:56px;border:1.5px solid var(--line);b
 </div>
 <div class="toast" id="toast" hidden></div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" async></script>
 <script>
 /* ===== Config: edit topic names / types to match the DIRT ROS 2 graph ===== */
 const SENSORS = {
@@ -549,6 +591,9 @@ const ESTOP      = {topic:'/dirt/estop', type:'std_msgs/msg/Bool', repeatMs:200,
 const TEMP_KEYS  = ['soilTemp','ambientTemp','batteryTemp','cpuTemp','motorL','motorR'];
 const TILES = [{k:'soilTemp',go:'soil'},{k:'soilMoisture',go:'soil'},{k:'soilPH',go:'soil'},{k:'soilEC',go:'soil'},{k:'ambientTemp',go:'temps',sel:'ambientTemp'},{k:'battery',go:'temps',sel:'batteryTemp'}];
 const HIST_MAX = 300, STALE_MS = 5000, SILENT_MS = 3000;
+// When the Pi serves this page to a phone, talk to rosbridge on that same host
+const SERVED = /^https?:$/.test(location.protocol) && location.hostname && !/claude/.test(location.hostname);
+const DEFAULT_URL = SERVED ? (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.hostname + ':9090' : 'ws://localhost:9090';
 
 /* every topic the screen subscribes to, deduplicated */
 const SUBS = (() => {
@@ -571,7 +616,7 @@ const save = (k, v) => { try { store && store.setItem('dirt.' + k, JSON.stringif
 
 const S = {
   mode: location.hash === '#live' ? 'live' : load('mode', 'demo'),
-  unit: load('unit', 'C'), theme: load('theme', 'auto'), sound: load('sound', 'on'), url: load('url', 'ws://localhost:9090'),
+  unit: load('unit', 'C'), theme: load('theme', 'auto'), sound: load('sound', 'on'), url: load('url', DEFAULT_URL), terrain: load('terrain', 'testyard'), showcase: 'off',
   view: 'overview', sel: 'cpuTemp', conn: 'demo',
   val: {}, ts: {}, hist: {}, spectrum: null, pls: null, samples: [], nextN: 1, cmp: [],
   rover: {yaw: null, x: null, y: null, v: null, w: null, cmd: null, scan: null, path: [], dist: 0},
@@ -798,7 +843,7 @@ function renderBanners() {
 function renderOverview() {
   const real = S.samples.filter(s => !s.example);
   const last = real[0] || S.samples[0];
-  $('#ovSub').textContent = last ? `Last sample ${timeStr(last.t, false)} · ${S.samples.length} logged` : 'No samples logged yet';
+  $('#ovSub').textContent = (last ? `Last sample ${timeStr(last.t, false)} · ${S.samples.length} logged` : 'No samples logged yet') + (S.conn === 'demo' ? ` · Demo terrain: ${terrain().label}` : '');
   TILES.forEach(({k}) => {
     const e = tileEls[k], h = S.hist[k] || [], st = status(k);
     if (k === 'battery') {
@@ -986,6 +1031,7 @@ function renderSystem() {
 
 function render() {
   renderTop(); renderBanners();
+  if (!$('#settings').hidden) renderPhone();
   ({overview: renderOverview, soil: renderSoil, rover: renderRover, temps: renderTemps, samples: renderSamples, system: renderSystem})[S.view]();
 }
 function go(v) {
@@ -996,10 +1042,37 @@ function go(v) {
 }
 
 /* ===== demo data ===== */
-const BASE = {soilTemp: 24.2, ambientTemp: 29.5, soilMoisture: 18.4, soilPH: 7.62, soilEC: 465, battery: 13.27, batteryTemp: 31, cpuTemp: 57, motorL: 38, motorR: 41};
+// Same terrain names as simulation/dirt_sim_core.py and rover_3d_panda.py (--terrain-mode)
+const TERRAINS = {
+  farmland:  {label: 'Farmland',  soil: {soilTemp: 22.8, ambientTemp: 28.5, soilMoisture: 26.5, soilPH: 6.9,  soilEC: 640}, pls: [2.15, .19, 29], albedo: .19, iron: .012, obs: 3,  rmin: .25, rmax: .4,  walls: false, ell: [2.1, 1.15]},
+  grassland: {label: 'Grassland', soil: {soilTemp: 23.6, ambientTemp: 29.5, soilMoisture: 19.5, soilPH: 7.3,  soilEC: 410}, pls: [1.85, .16, 31], albedo: .22, iron: .014, obs: 5,  rmin: .2,  rmax: .35, walls: false, ell: [2.0, 1.1]},
+  rolling:   {label: 'Rolling',   soil: {soilTemp: 24.1, ambientTemp: 30.0, soilMoisture: 15.8, soilPH: 7.6,  soilEC: 470}, pls: [1.35, .12, 34], albedo: .25, iron: .016, obs: 6,  rmin: .3,  rmax: .6,  walls: false, ell: [2.2, 1.2]},
+  dunes:     {label: 'Dunes',     soil: {soilTemp: 31.5, ambientTemp: 35.5, soilMoisture: 3.6,  soilPH: 8.2,  soilEC: 190}, pls: [.28, .03, 6],   albedo: .4,  iron: .03,  obs: 2,  rmin: .7,  rmax: 1.0, walls: false, ell: [2.3, 1.3]},
+  rocky:     {label: 'Rocky',     soil: {soilTemp: 27.2, ambientTemp: 32.0, soilMoisture: 8.9,  soilPH: 7.9,  soilEC: 350}, pls: [.74, .07, 18],  albedo: .3,  iron: .022, obs: 16, rmin: .1,  rmax: .28, walls: false, ell: [1.9, 1.05]},
+  testyard:  {label: 'Test yard', soil: {soilTemp: 24.2, ambientTemp: 29.5, soilMoisture: 18.4, soilPH: 7.62, soilEC: 465}, pls: [1.42, .118, 34], albedo: .25, iron: .015, obs: 5,  rmin: .2,  rmax: .45, walls: true,  ell: [1.9, 1.05]},
+};
+const terrain = () => TERRAINS[S.terrain] || TERRAINS.testyard;
+let BASE = {};
+function terrainBase() {
+  const t = terrain(), rough = t.obs > 10 ? 6 : 0;
+  return {...t.soil, battery: BASE.battery != null ? BASE.battery : 13.27, batteryTemp: 31 + (t.soil.ambientTemp - 29.5) * .5, cpuTemp: 57, motorL: 38 + rough, motorR: 41 + rough};
+}
 const NOISE = {soilTemp: .05, ambientTemp: .15, soilMoisture: .18, soilPH: .012, soilEC: 5, battery: .004, batteryTemp: .08, cpuTemp: .9, motorL: .4, motorR: .4};
-const WORLD = {xmin: -3.2, xmax: 3.2, ymin: -2.2, ymax: 2.2, obs: [[0, 0, .45], [2.55, 1.45, .3], [-2.45, -1.5, .35], [-.7, 1.75, .25], [1.2, -1.7, .2]]};
-const PATH_A = 1.9, PATH_B = 1.05;
+let WORLD = {walls: true, xmin: -3.2, xmax: 3.2, ymin: -2.2, ymax: 2.2, obs: []}, PATH_A = 1.9, PATH_B = 1.05;
+function buildWorld() {
+  const t = terrain(); PATH_A = t.ell[0]; PATH_B = t.ell[1];
+  let seed = [...S.terrain].reduce((a, ch) => (a * 31 + ch.charCodeAt(0)) >>> 0, 7);
+  const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const obs = []; let tries = 0;
+  while (obs.length < t.obs && tries++ < 3000) {
+    const r = t.rmin + rnd() * (t.rmax - t.rmin), x = (rnd() * 2 - 1) * (PATH_A + 1.4), y = (rnd() * 2 - 1) * (PATH_B + 1.1);
+    let clear = Infinity;
+    for (let k = 0; k < 72; k++) { const a = k / 72 * 2 * Math.PI; clear = Math.min(clear, Math.hypot(x - PATH_A * Math.cos(a), y - PATH_B * Math.sin(a))); }
+    if (clear < r + .4 || obs.some(([ox, oy, or]) => Math.hypot(x - ox, y - oy) < r + or + .15)) continue;
+    obs.push([x, y, r]);
+  }
+  WORLD = {walls: t.walls, xmin: -PATH_A - 1.3, xmax: PATH_A + 1.3, ymin: -PATH_B - 1.15, ymax: PATH_B + 1.15, obs};
+}
 const DEMO_HZ = {[ROVER.imu.topic]: 10, [ROVER.odom.topic]: 10, [ROVER.wheel.topic]: 10, [ROVER.cmd.topic]: 10, [ROVER.scan.topic]: 5, [SPECTRUM.topic]: .25, [PLS.topic]: .25};
 const DEMO_LOGS = [
   [20, 'micro_ros_agent', 'Session established with ESP32 client on /dev/ttyUSB0'], [20, 'ld19_driver', 'Scan publishing at 10 Hz'],
@@ -1010,11 +1083,11 @@ const DEMO_LOGS = [
 let sim = {...BASE}, demoTimer = null, motionTimer = null, demoTick = 0, theta = 0;
 function stepSim() { for (const k in sim) sim[k] += (BASE[k] - sim[k]) * .03 + (Math.random() - .5) * 2 * NOISE[k]; BASE.battery -= .0003; }
 function genSpectrum(wet = (sim.soilMoisture || 18) / 100) {
-  const n = Math.round((SPECTRUM.wlEnd - SPECTRUM.wlStart) / 5) + 1, out = [];
+  const t = terrain(), n = Math.round((SPECTRUM.wlEnd - SPECTRUM.wlStart) / 5) + 1, out = [];
   for (let i = 0; i < n; i++) {
     const wl = SPECTRUM.wlStart + i * 5;
-    let r = .07 + .25 * (1 - Math.exp(-(wl - 400) / 230)) * (1 - wet * 1.2);
-    r -= .015 * Math.exp(-(((wl - 880) / 70) ** 2));
+    let r = .05 + t.albedo * (1 - Math.exp(-(wl - 400) / 230)) * (1 - wet * 1.2);
+    r -= t.iron * Math.exp(-(((wl - 880) / 70) ** 2));
     r -= .22 * wet * Math.exp(-(((wl - 970) / 22) ** 2));
     out.push(Math.max(0, r + (Math.random() - .5) * .004));
   }
@@ -1022,8 +1095,10 @@ function genSpectrum(wet = (sim.soilMoisture || 18) / 100) {
 }
 function rayDist(px, py, dx, dy) {
   let t = Infinity;
-  if (dx > 0) t = Math.min(t, (WORLD.xmax - px) / dx); else if (dx < 0) t = Math.min(t, (WORLD.xmin - px) / dx);
-  if (dy > 0) t = Math.min(t, (WORLD.ymax - py) / dy); else if (dy < 0) t = Math.min(t, (WORLD.ymin - py) / dy);
+  if (WORLD.walls) {
+    if (dx > 0) t = Math.min(t, (WORLD.xmax - px) / dx); else if (dx < 0) t = Math.min(t, (WORLD.xmin - px) / dx);
+    if (dy > 0) t = Math.min(t, (WORLD.ymax - py) / dy); else if (dy < 0) t = Math.min(t, (WORLD.ymin - py) / dy);
+  }
   for (const [cx, cy, r] of WORLD.obs) { const ox = px - cx, oy = py - cy, b = ox * dx + oy * dy, cc = ox * ox + oy * oy - r * r, disc = b * b - cc; if (disc >= 0) { const s = -b - Math.sqrt(disc); if (s > 0) t = Math.min(t, s); } }
   return t;
 }
@@ -1047,15 +1122,17 @@ function demoRx() {
 }
 function startDemo() {
   stopLive(); clearInterval(demoTimer); clearInterval(motionTimer);
-  S.conn = 'demo'; resetData(); sim = {...BASE}; theta = 0;
+  S.conn = 'demo'; resetData(); buildWorld(); BASE = terrainBase(); sim = {...BASE}; theta = 0;
   const now = Date.now();
   for (let i = 160; i > 0; i--) { stepSim(); for (const k in sim) setVal(k, sim[k], now - i * 1000); }
   for (let i = 0; i < 150; i++) stepMotion(.4); S.rover.dist = 0;
-  S.spectrum = genSpectrum(); S.pls = [1.42, .118, 34];
+  S.spectrum = genSpectrum(); S.pls = terrain().pls.slice();
   S.stats = {cpu: 24, mem: 41, disk: 37, uptime: 3 * 3600 + 1260};
   S.logs = DEMO_LOGS.slice(0, 5).map((l, i) => ({t: now - (5 - i) * 47000, level: l[0], name: l[1], text: l[2]})).reverse();
   if (!S.samples.some(s => !s.example)) {
-    const ex = [[42, 22.9, 16.2, 7.49, 438, 1.21, .4], [27, 23.6, 21.7, 7.71, 512, 1.55, 2.1], [9, 24.4, 18.9, 7.58, 471, 1.39, 3.9]];
+    const sb = terrain().soil, pb = terrain().pls;
+    const ex = [[42, -.6, -.08, -.04, -.06, -.12, .4], [27, .2, .15, .05, .08, .1, 2.1], [9, .4, .03, -.01, .01, -.02, 3.9]]
+      .map(([m, dt, dm, dp, de, dc, th]) => [m, sb.soilTemp + dt * 2, sb.soilMoisture * (1 + dm), sb.soilPH + dp * 2, sb.soilEC * (1 + de), pb[0] * (1 + dc), th]);
     S.samples = ex.map(([m, t, mo, ph, ec, soc, th], i) => ({n: i + 1, t: now - m * 60e3, soilTemp: t, soilMoisture: mo, soilPH: ph, soilEC: ec, soc, x: PATH_A * Math.cos(th), y: PATH_B * Math.sin(th), spectrum: genSpectrum(mo / 100), example: true})).reverse();
     S.nextN = 4; S.cmp = [3, 2];
   }
@@ -1163,13 +1240,13 @@ function beep() {
 /* ===== actions ===== */
 let toastT;
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => t.hidden = true, 2400); }
-function takeSample() {
+function takeSample(quiet = false) {
   const live = S.conn === 'live';
   if (live) send({op: 'publish', topic: SAMPLE_REQ.topic, msg: {}});
   if (S.samples.every(s => s.example)) { S.samples = []; S.cmp = []; S.nextN = 1; }
   const r = S.rover;
   S.samples.unshift({n: S.nextN++, t: Date.now(), soilTemp: S.val.soilTemp, soilMoisture: S.val.soilMoisture, soilPH: S.val.soilPH, soilEC: S.val.soilEC, soc: S.pls ? S.pls[0] : null, x: r.x, y: r.y, spectrum: S.spectrum ? S.spectrum.slice() : null, saved: false});
-  toast(live ? 'Sample requested. Saving on the Pi' : S.conn === 'demo' ? 'Demo sample logged' : 'Rover offline. Sample kept on this screen only');
+  if (!quiet) toast(live ? 'Sample requested. Saving on the Pi' : S.conn === 'demo' ? 'Demo sample logged' : 'Rover offline. Sample kept on this screen only');
   render();
 }
 function toCSV() {
@@ -1190,7 +1267,24 @@ function toggleCmp(n) {
 function applyTheme() { if (S.theme === 'auto') document.documentElement.removeAttribute('data-theme'); else document.documentElement.setAttribute('data-theme', S.theme); drawTerrain(); }
 function syncSegs() { $$('[data-seg]').forEach(seg => seg.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', String(S[seg.dataset.seg] === b.dataset.v)))); }
 function setMode(m) { S.mode = m; save('mode', m); syncSegs(); if (!$('#boot').hidden) hideBoot(); m === 'live' ? startLive() : startDemo(); }
-function openSettings() { $('#wsUrl').value = S.url; syncSegs(); $('#settings').hidden = false; }
+function openSettings() { $('#wsUrl').value = S.url; syncSegs(); $('#settings').hidden = false; renderPhone(); }
+let qrText = '';
+function phoneUrls() {
+  if (SERVED && !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) return [location.origin + '/'];
+  return ((S.stats && S.stats.ips) || []).map(ip => `http://${ip}:${(S.stats && S.stats.web_port) || 8080}/`);
+}
+function renderPhone() {
+  const urls = phoneUrls();
+  const html = urls.length
+    ? urls.map(u => `<code>${u}</code>`).join('') + '<p class="sub">Scan or type this on a phone on the same Wi-Fi. The STOP button works from the phone too.</p>'
+    : `<p class="sub">${S.conn === 'live' ? 'Waiting for the Pi to report its address.' : 'Connect to the rover to get the phone link. The Pi serves this screen on port 8080.'}</p>`;
+  const box = $('#phoneUrls'); if (box.dataset.html !== html) { box.innerHTML = html; box.dataset.html = html; }
+  const q = $('#qr'), text = urls[0] || '';
+  if (text === qrText) return;
+  q.innerHTML = '';
+  if (!text || !window.QRCode) { qrText = ''; return; }
+  try { new QRCode(q, {text, width: 132, height: 132, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.M}); qrText = text; } catch (e) { q.innerHTML = ''; }
+}
 
 $('#openSettings').addEventListener('click', openSettings);
 $('#modePill').addEventListener('click', openSettings);
@@ -1205,19 +1299,70 @@ document.addEventListener('click', e => {
     else if (act === 'csv') copyCSV();
     else if (act === 'close') $('#settings').hidden = true;
     else if (act === 'menu') { $('#settings').hidden = true; go('overview'); runBoot(); }
-    else if (act === 'connect') { S.url = $('#wsUrl').value.trim() || 'ws://localhost:9090'; save('url', S.url); if (S.mode === 'live') connect(); else setMode('live'); }
+    else if (act === 'connect') { S.url = $('#wsUrl').value.trim() || DEFAULT_URL; save('url', S.url); if (S.mode === 'live') connect(); else setMode('live'); }
   }
   const sb = e.target.closest('[data-seg] button'); if (sb) {
     const key = sb.closest('[data-seg]').dataset.seg, v = sb.dataset.v;
     if (key === 'mode') { if (v !== S.mode) setMode(v); }
-    else { S[key] = v; save(key, v); if (key === 'theme') applyTheme(); syncSegs(); render(); }
+    else if (key === 'showcase') { v === 'on' ? startShowcase() : stopShowcase(); }
+    else { S[key] = v; save(key, v); if (key === 'theme') applyTheme(); if (key === 'terrain' && S.conn === 'demo') startDemo(); syncSegs(); render(); }
   }
 });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') $('#settings').hidden = true; });
 document.addEventListener('pointerdown', function wl() { try { navigator.wakeLock && navigator.wakeLock.request('screen').catch(() => {}); } catch (e) {} document.removeEventListener('pointerdown', wl); });
 window.addEventListener('resize', () => { drawTerrain(); render(); });
 try { matchMedia('(prefers-color-scheme: dark)').addEventListener('change', drawTerrain); } catch (e) {}
-window.addEventListener('hashchange', () => { if (location.hash === '#live' && S.mode !== 'live') setMode('live'); });
+window.addEventListener('hashchange', () => { if (location.hash === '#live' && S.mode !== 'live') setMode('live'); if (location.hash === '#showcase' && S.showcase !== 'on') { if ($('#boot').hidden === false) hideBoot(); startShowcase(); } });
+
+/* ===== showcase loop for visitors ===== */
+const TOUR = [
+  ['overview', 'Live readings from DIRT', 'Everything the rover senses at once: soil temperature, moisture, pH, salinity, air temperature and battery.'],
+  ['soil', 'Reading the soil', 'A probe measures moisture, pH, temperature and salinity. The spectrometer reads how soil reflects light, and a PLS model turns that into organic carbon, nitrogen and clay.'],
+  ['rover', 'How DIRT sees', 'An LD19 LiDAR scans all the way around the rover, and Nav2 uses it to steer the tank treads around obstacles.'],
+  ['temps', 'Keeping cool in Texas heat', 'The drive motors, battery pack and Raspberry Pi 5 are watched constantly, with warnings before anything overheats.'],
+  ['samples', 'Every sample, mapped', 'Each sample is tagged with where the rover took it, and any two spectra can be compared side by side.'],
+  ['system', 'Under the hood', 'ROS 2 Jazzy runs on a Raspberry Pi 5, which talks to an ESP32 running micro-ROS that drives the motors.'],
+];
+const DWELL = 12000, IDLE_RESUME = 60000;
+let tourI = -1, tourStart = 0, tourT = null, idleT = null, tourPaused = false;
+function startShowcase() {
+  S.showcase = 'on'; syncSegs(); $('#settings').hidden = true;
+  if (S.conn !== 'live' && S.conn !== 'demo') setMode('demo');
+  tourPaused = false; tourI = -1; document.body.classList.add('touring'); nextStep();
+  clearInterval(tourT); tourT = setInterval(tourTick, 100);
+}
+function stopShowcase() {
+  S.showcase = 'off'; syncSegs(); clearInterval(tourT); clearTimeout(idleT); tourT = idleT = null;
+  document.body.classList.remove('touring'); $('#tour').hidden = true;
+}
+function nextStep() {
+  tourI++;
+  if (tourI >= TOUR.length) {
+    tourI = 0;
+    if (S.conn === 'demo') { S.samples = S.samples.filter(x => !x.tour); S.cmp = []; const keys = Object.keys(TERRAINS); S.terrain = keys[(keys.indexOf(S.terrain) + 1) % keys.length]; save('terrain', S.terrain); syncSegs(); startDemo(); }
+  }
+  const [view, title, text] = TOUR[tourI];
+  if (view === 'samples' && S.conn === 'demo') { takeSample(true); S.samples[0].tour = true; S.cmp = S.samples.slice(0, 2).map(s => s.n); }
+  if (view === 'temps') S.sel = TEMP_KEYS[Math.floor(Math.random() * TEMP_KEYS.length)];
+  go(view);
+  $('#tourStep').textContent = `${tourI + 1} of ${TOUR.length}`;
+  $('#tourTerrain').textContent = S.conn === 'demo' ? 'Demo terrain: ' + terrain().label : 'Live from the rover';
+  $('#tourTitle').textContent = title; $('#tourText').textContent = text;
+  $('#tourBar').style.width = '0';
+  $('#tour').hidden = false; tourStart = performance.now();
+}
+function tourTick() {
+  if (tourPaused) return;
+  const p = Math.min(1, (performance.now() - tourStart) / DWELL);
+  $('#tourBar').style.width = (p * 100) + '%';
+  if (p >= 1) nextStep();
+}
+function pauseTour() {
+  tourPaused = true; $('#tour').hidden = true; document.body.classList.remove('touring');
+  clearTimeout(idleT);
+  idleT = setTimeout(() => { if (S.showcase === 'on') { tourPaused = false; document.body.classList.add('touring'); tourI--; nextStep(); } }, IDLE_RESUME);
+}
+document.addEventListener('pointerdown', e => { if (S.showcase === 'on' && !e.target.closest('#settings')) pauseTour(); }, {capture: true});
 
 /* ===== TURTLE start menu ===== */
 let bootT = null, bootPrimary = 'demo';
@@ -1232,18 +1377,19 @@ function probe(url, ms = 2500) {
 function setChecks(rows) { $('#bootChecks').innerHTML = rows.map(([a, b, c]) => `<li><span>${a}</span><b class="${c || ''}">${b}</b></li>`).join(''); }
 function setPrimary(v) { bootPrimary = v; $$('.bm').forEach(b => b.classList.toggle('primary', b.dataset.boot === v)); }
 async function runBoot() {
-  clearInterval(bootT); bootT = null; clearInterval(demoTimer); clearInterval(motionTimer); demoTimer = motionTimer = null; stopLive();
+  clearInterval(bootT); bootT = null; clearInterval(demoTimer); clearInterval(motionTimer); demoTimer = motionTimer = null; stopLive(); stopShowcase();
   const b = $('#boot'); b.hidden = false; requestAnimationFrame(() => b.classList.remove('out'));
   const base = [['Interface', 'Ready', 'ok'], ['Screen', innerWidth + ' x ' + innerHeight, 'ok']];
   setChecks(base.concat([['Rover link ' + S.url, 'Checking']]));
-  setPrimary(location.hash === '#live' ? 'live' : 'demo'); $('#bootCount').textContent = '';
+  const hashPick = location.hash === '#showcase' ? 'showcase' : location.hash === '#live' ? 'live' : null;
+  setPrimary(hashPick || 'demo'); $('#bootCount').textContent = '';
   const found = await probe(S.url);
   if (b.hidden || b.classList.contains('out')) return;
   setChecks(base.concat([['Rover link ' + S.url, found ? 'Found' : 'Not found', found ? 'ok' : 'no']]));
   $('#bmLiveSub').textContent = found ? 'Rover found. Live data ready' : 'Rover not found yet. Will keep retrying';
-  setPrimary(found || location.hash === '#live' ? 'live' : 'demo');
+  setPrimary(hashPick || (found ? 'live' : 'demo'));
   let n = 10;
-  const label = () => { $('#bootCount').textContent = `Starting ${bootPrimary === 'live' ? 'rover display' : 'demo mode'} in ${n} s. Touch anywhere to stay on this menu.`; };
+  const label = () => { $('#bootCount').textContent = `Starting ${({live: 'rover display', demo: 'demo mode', showcase: 'showcase'})[bootPrimary]} in ${n} s. Touch anywhere to stay on this menu.`; };
   label();
   bootT = setInterval(() => { n--; if (n <= 0) { clearInterval(bootT); bootT = null; chooseBoot(bootPrimary); } else label(); }, 1000);
 }
@@ -1251,6 +1397,7 @@ function hideBoot() { clearInterval(bootT); bootT = null; const b = $('#boot'); 
 function chooseBoot(v) {
   clearInterval(bootT); bootT = null;
   if (v === 'settings') { $('#bootCount').textContent = ''; openSettings(); return; }
+  if (v === 'showcase') { setMode(S.conn === 'live' ? 'live' : 'demo'); startShowcase(); return; }
   setMode(v);
 }
 $('#boot').addEventListener('pointerdown', () => { if (bootT) { clearInterval(bootT); bootT = null; $('#bootCount').textContent = ''; } });

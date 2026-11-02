@@ -145,12 +145,21 @@ no build step.
 | File | Purpose |
 | --- | --- |
 | `dirt_display.html` | The display. Open it in any browser. |
-| `dirt_display_node.py` | ROS 2 helper node: saves samples to CSV, publishes Pi stats, optional e-stop gate |
-| `setup_dirt_display.sh` | One-time Pi setup: rosbridge, boot services, full-screen kiosk |
+| `dirt_display_node.py` | ROS 2 helper node: saves samples to CSV, publishes Pi stats and network address, optional e-stop gate |
+| `setup_dirt_display.sh` | One-time Pi setup: rosbridge, boot services, phone web server, full-screen kiosk |
 
 **Try it on any computer.** Open `DIRT Display/dirt_display.html` in a browser
 and choose **Demo mode** on the TURTLE start menu. Demo mode simulates the
-rover and needs no ROS install.
+rover and needs no ROS install. It uses the same terrain maps as the Panda3D
+viewer (`farmland`, `grassland`, `rolling`, `dunes`, `rocky`, `testyard`); pick
+one under Settings, Demo terrain. Each map has its own obstacles in the LiDAR
+view, its own soil readings, and its own spectrum.
+
+**Showcase mode** (for PDR, recruiting tables, and events) cycles through every
+view with a caption for visitors and moves to the next terrain each loop. Start
+it from the start menu or Settings. A touch pauses it, and it resumes after 60
+seconds. Open the display with `#showcase` at the end of the URL to start it
+automatically.
 
 **Install on the rover Pi** (Ubuntu 24.04 + ROS 2 Jazzy):
 
@@ -161,7 +170,13 @@ sudo reboot
 ```
 
 After reboot the Pi opens the display full screen. The start menu checks for
-rosbridge and switches to live data after 10 seconds. Samples are saved in
+rosbridge and switches to live data after 10 seconds.
+
+**Open it on a phone.** The Pi also serves the display on port 8080. Any phone
+on the same network can open `http://<pi-address>:8080/`, and Settings, Open on
+a phone shows the address and a QR code. The phone gets the full display,
+including the STOP button. Campus Wi-Fi usually blocks phone-to-device traffic,
+so use a hotspot or travel router for the rover. Samples are saved in
 `~/dirt_samples/` as `samples_YYYYMMDD.csv` and `spectra_YYYYMMDD.csv`.
 
 To also turn on the software e-stop gate, run

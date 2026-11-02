@@ -6,9 +6,10 @@ Does three jobs for the touchscreen display:
      readings, odom position, PLS output and the full spectrum to CSV files
      in ~/dirt_samples, then publishes /dirt/samples/saved so the screen can
      mark the sample as stored on the Pi.
-  2. Pi system stats: publishes CPU, memory, disk and uptime once a second on
-     /dirt/pi/stats (JSON string) and the CPU temperature on
-     /dirt/pi/cpu_temperature.
+  2. Pi system stats: publishes CPU, memory, disk, uptime and the Pi's network
+     addresses once a second on /dirt/pi/stats (JSON string), plus the CPU
+     temperature on /dirt/pi/cpu_temperature. The display uses the addresses
+     to show the phone link and QR code.
   3. E-stop gate (optional, off by default): sits between Nav2 and the
      ESP32. With gate_enabled:=true it passes /cmd_vel_nav through to
      /cmd_vel and sends zero velocity at 10 Hz while /dirt/estop is true.
@@ -23,6 +24,8 @@ import csv
 import datetime
 import json
 import shutil
+import subprocess
+import time
 from pathlib import Path
 
 import rclpy
@@ -58,6 +61,7 @@ class DirtDisplayNode(Node):
         self.declare_parameter('gate_enabled', False)
         self.declare_parameter('gate_in', '/cmd_vel_nav')
         self.declare_parameter('gate_out', '/cmd_vel')
+        self.declare_parameter('web_port', 8080)
 
         self.sample_dir = Path(self.get_parameter('sample_dir').value).expanduser()
         self.sample_dir.mkdir(parents=True, exist_ok=True)
@@ -65,7 +69,12 @@ class DirtDisplayNode(Node):
         self.spectrum = None
         self.pls = None
         self.estop = False
-        self.prev_cpu = self._read_cpu()
+        self.web_port = int(self.get_parameter('web_port').value)
+        self._ips, self._ips_at = [], 0.0
+        try:
+            self.prev_cpu = self._read_cpu()
+        except OSError:  # not on Linux (no /proc), stats will be skipped
+            self.prev_cpu = (0, 0)
 
         # latest readings for the sample logger
         self.create_subscription(Temperature, TOPIC_SOIL_TEMP, lambda m: self._set('soil_temp_C', m.temperature), 10)
@@ -148,6 +157,15 @@ class DirtDisplayNode(Node):
         idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
         return idle, sum(parts)
 
+    @staticmethod
+    def _read_ips():
+        try:
+            out = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            return []
+        # IPv4 only, skip loopback and Docker bridges
+        return [ip for ip in out if ':' not in ip and not ip.startswith(('127.', '172.17.'))]
+
     def _publish_stats(self):
         stats = {}
         try:
@@ -176,6 +194,10 @@ class DirtDisplayNode(Node):
                 stats['uptime'] = int(float(f.read().split()[0]))
         except OSError:
             pass
+        if time.monotonic() - self._ips_at > 10:
+            self._ips, self._ips_at = self._read_ips(), time.monotonic()
+        stats['ips'] = self._ips
+        stats['web_port'] = self.web_port
         self.stats_pub.publish(String(data=json.dumps(stats)))
 
         try:
