@@ -2,7 +2,8 @@
 
 DIRT is a rover platform for autonomous soil sampling. The repository contains
 the rover control modules, navigation and sensing simulations, a Panda3D
-visualizer, CAD references, and machine-learning model helpers.
+visualizer, an on-rover touchscreen display, CAD references, and
+machine-learning model helpers.
 
 ## Features
 
@@ -11,6 +12,8 @@ visualizer, CAD references, and machine-learning model helpers.
 - GPS/navigation, distance-sensor, and vision-alignment modules
 - Headless rover physics simulation
 - Interactive Panda3D 3D rover viewer
+- Touchscreen field display for the Pi 5 (soil data, temperatures, LiDAR,
+  e-stop, sample logging)
 - Raspberry Pi hardware integration points
 - Optional local language-model loading helpers
 
@@ -131,6 +134,77 @@ Viewer controls include:
 - `R`: reset
 - `Q`: quit
 
+### Touchscreen field display
+
+`DIRT Display/` holds the touchscreen interface that runs on the rover's
+Raspberry Pi 5. It shows soil readings, temperatures, LiDAR, heading, drive
+commands, logged samples, and system health, and it has an on-screen e-stop.
+It talks to the ROS 2 stack through rosbridge, so it is a single HTML file with
+no build step.
+
+| File | Purpose |
+| --- | --- |
+| `dirt_display.html` | The display. Open it in any browser. |
+| `dirt_display_node.py` | ROS 2 helper node: saves samples to CSV, publishes Pi stats, optional e-stop gate |
+| `setup_dirt_display.sh` | One-time Pi setup: rosbridge, boot services, full-screen kiosk |
+
+**Try it on any computer.** Open `DIRT Display/dirt_display.html` in a browser
+and choose **Demo mode** on the TURTLE start menu. Demo mode simulates the
+rover and needs no ROS install.
+
+**Install on the rover Pi** (Ubuntu 24.04 + ROS 2 Jazzy):
+
+```bash
+cd "DIRT Display"
+bash setup_dirt_display.sh
+sudo reboot
+```
+
+After reboot the Pi opens the display full screen. The start menu checks for
+rosbridge and switches to live data after 10 seconds. Samples are saved in
+`~/dirt_samples/` as `samples_YYYYMMDD.csv` and `spectra_YYYYMMDD.csv`.
+
+To also turn on the software e-stop gate, run
+`DIRT_ESTOP_GATE=true bash setup_dirt_display.sh` and remap Nav2's velocity
+output to `/cmd_vel_nav`.
+
+**Run the helper node by hand** (on the Pi or in WSL with ROS 2 Jazzy). It needs
+ROS 2 sourced, not the project venv, because `rclpy` comes with ROS 2 and is not
+a pip package:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+python3 "DIRT Display/dirt_display_node.py"
+```
+
+**ROS 2 topics.** The display subscribes to these by default. If a topic name
+in the stack is different, change the `SENSORS`, `ROVER`, and `SYS` blocks at
+the top of the script in `dirt_display.html`, and the matching constants at the
+top of `dirt_display_node.py`.
+
+| Topic | Type | Used for |
+| --- | --- | --- |
+| `/dirt/soil/temperature` | `sensor_msgs/Temperature` | Soil temperature |
+| `/dirt/soil/moisture` | `std_msgs/Float32` | Moisture (% VWC) |
+| `/dirt/soil/ph` | `std_msgs/Float32` | Soil pH |
+| `/dirt/soil/ec` | `std_msgs/Float32` | Conductivity (µS/cm) |
+| `/dirt/env/temperature` | `sensor_msgs/Temperature` | Air temperature |
+| `/dirt/battery` | `sensor_msgs/BatteryState` | Battery voltage and pack temperature |
+| `/dirt/pi/cpu_temperature` | `sensor_msgs/Temperature` | Pi 5 CPU (published by the helper node) |
+| `/dirt/motors/left/temperature`, `/dirt/motors/right/temperature` | `sensor_msgs/Temperature` | Drive motor temperatures |
+| `/dirt/spectrometer/reflectance` | `std_msgs/Float32MultiArray` | Spectrum, 400 to 1000 nm evenly spaced |
+| `/dirt/pls/predictions` | `std_msgs/Float32MultiArray` | PLS output: organic carbon, total nitrogen, clay |
+| `/imu`, `/odom`, `/scan`, `/cmd_vel`, `/wheel_odom` | standard types | Heading, position, LiDAR, drive, ESP32 link |
+| `/dirt/pi/stats` | `std_msgs/String` (JSON) | Pi CPU, memory, disk, uptime |
+| `/rosout` | `rcl_interfaces/Log` | Recent log in the System view |
+
+The display publishes `/dirt/ui/sample_request` (`std_msgs/Empty`) when someone
+taps Take sample, and `/dirt/estop` (`std_msgs/Bool`) from the STOP button.
+
+**E-stop note.** The on-screen STOP only publishes `/dirt/estop`. The ESP32
+firmware must subscribe to it and stop the motors, or the gate must be enabled.
+It is a backup to the physical e-stop, not a replacement.
+
 ## Repository layout
 
 | Directory or file | Purpose |
@@ -140,6 +214,7 @@ Viewer controls include:
 | `simulation/` | Headless physics, alignment, spectrometer, and 3D simulations |
 | `spectrometer/` | Spectrometer interfaces and simulation support |
 | `lm_models/` | Optional language-model loading helpers |
+| `DIRT Display/` | Touchscreen field display, ROS 2 helper node, and Pi setup script |
 | `CAD/` | Mechanical CAD files and assemblies |
 | `Sim_Data/` | Simulation datasets and generated analysis data |
 | `tests/` | Automated tests |
@@ -166,6 +241,9 @@ Panda3D functionality. Use the headless simulation for environments without a
 display.
 
 ## Data and generated files
+
+The display's helper node writes samples to `~/dirt_samples/` on the Pi, not
+into the repository.
 
 Simulation runs write CSV logs containing pose, terrain, motor, power, and
 mission data. Prefer writing new runs into a separate output directory such as
