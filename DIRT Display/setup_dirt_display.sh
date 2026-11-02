@@ -7,14 +7,17 @@
 # What it does:
 #   1. Installs rosbridge (the WebSocket bridge the display talks to)
 #   2. Copies the display and helper node to ~/dirt_display
-#   3. Creates two services that start on boot:
+#   3. Creates three services that start on boot:
 #        dirt-rosbridge      rosbridge on port 9090
 #        dirt-display-node   sample logger, Pi stats, optional e-stop gate
+#        dirt-display-web    serves the display on port 8080 so phones can open it
 #   4. Opens the display full screen in Chromium when the desktop logs in
+#      (add #showcase to the URL in ~/.config/autostart/dirt-display.desktop
+#      to boot straight into the showcase loop for events)
 #   5. Turns off screen blanking
 #
 # Useful afterwards:
-#   systemctl --user status dirt-rosbridge dirt-display-node
+#   systemctl --user status dirt-rosbridge dirt-display-node dirt-display-web
 #   journalctl --user -u dirt-display-node -f
 #   ls ~/dirt_samples
 set -euo pipefail
@@ -36,6 +39,7 @@ sudo apt-get install -y ros-jazzy-rosbridge-suite
 echo "== Copying files to $DIR"
 mkdir -p "$DIR" "$HOME/dirt_samples"
 cp "$HERE/dirt_display.html" "$HERE/dirt_display_node.py" "$DIR/"
+cp "$HERE/dirt_display.html" "$DIR/index.html"   # so phones can just open http://<pi>:8080/
 
 # Keep the team's ROS_DOMAIN_ID if one is set in ~/.bashrc
 DOMAIN_LINE=""
@@ -78,8 +82,22 @@ RestartSec=3
 WantedBy=default.target
 EOF
 
+cat > "$UNIT_DIR/dirt-display-web.service" <<EOF
+[Unit]
+Description=DIRT display web server (port 8080, for phones)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m http.server 8080 --bind 0.0.0.0 --directory $DIR
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+EOF
+
 systemctl --user daemon-reload
-systemctl --user enable --now dirt-rosbridge.service dirt-display-node.service
+systemctl --user enable --now dirt-rosbridge.service dirt-display-node.service dirt-display-web.service
 # keep the services running even when nobody is logged in over SSH
 sudo loginctl enable-linger "$USER"
 
@@ -95,7 +113,7 @@ cat > "$HOME/.config/autostart/dirt-display.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=DIRT Field Display
-Exec=$BROWSER --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --password-store=basic --check-for-update-interval=31536000 file://$DIR/dirt_display.html#live
+Exec=$BROWSER --kiosk --noerrdialogs --disable-infobars --disable-session-crashed-bubble --password-store=basic --check-for-update-interval=31536000 http://localhost:8080/#live
 X-GNOME-Autostart-enabled=true
 EOF
 
@@ -109,6 +127,10 @@ echo
 echo "Done. Reboot to test:  sudo reboot"
 echo "The display opens on the TURTLE start menu and goes live after 10 s."
 echo "Samples are saved in $HOME/dirt_samples"
+echo
+echo "Phones on the same Wi-Fi can open the display at:"
+for ip in $(hostname -I); do [[ "$ip" == *:* ]] || echo "  http://$ip:8080/"; done
+echo "(Campus Wi-Fi usually blocks phone-to-device traffic. Use a hotspot or travel router.)"
 if [[ "$GATE" == "true" ]]; then
   echo "E-stop gate is ON: remap Nav2's velocity output to /cmd_vel_nav."
 fi
