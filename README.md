@@ -1,40 +1,124 @@
-# DIRT
+# DIRT: Diagnostic Inspection Robot for Terrain
 
-DIRT is a rover platform for autonomous soil sampling. The repository contains
-the rover control modules, navigation and sensing simulations, a Panda3D
-visualizer, an on-rover touchscreen display, CAD references, and
-machine-learning model helpers.
+DIRT is an autonomous soil-diagnostic rover built by the DIRT project team at
+TURTLE Robotics (Texas A&M University). It drives
+to waypoints across a field, drills a subsurface soil sample, and runs an
+on-the-spot spectral analysis, so soil quality can be checked faster, more
+densely, and more cheaply than hand sampling and lab testing.
 
-## Features
+This repository holds the rover software: mission logic, navigation, the
+spectrometer and PLS soil model, the Panda3D rover simulation, the Pi 5
+touchscreen display, and reference CAD.
 
-- Autonomous waypoint navigation and mission sequencing
-- Drill and spectrometer simulation
-- GPS/navigation, distance-sensor, and vision-alignment modules
-- Headless rover physics simulation
-- Interactive Panda3D 3D rover viewer
-- Touchscreen field display for the Pi 5 (soil data, temperatures, LiDAR,
-  e-stop, sample logging)
-- Raspberry Pi hardware integration points
-- Optional local language-model loading helpers
+**Status (Fall 2026):** Preliminary Design Review held Nov 8, 2026.
+Spring 2027 is the prototyping phase: printed hull and treads, drive test, and
+drill test.
 
-## Requirements
+## Contents
 
-- Python 3.10 or newer
-- NumPy
-- OpenCV
-- gpiozero
-- scikit-learn
-- smbus2
-- pyserial
-- Panda3D for the 3D viewer
+- [How the rover works](#how-the-rover-works)
+- [Hardware](#hardware)
+- [Repository layout](#repository-layout)
+- [Setup](#setup)
+- [Running the project](#running-the-project)
+- [Testing](#testing)
+- [Known issues and gaps](#known-issues-and-gaps)
+- [Contributing](#contributing)
+- [Team](#team)
 
-Raspberry Pi GPIO support is installed only on Linux. ROS 2 support is
-optional.
+## How the rover works
+
+Each mission loops through the same steps:
+
+1. **Load mission:** waypoints for the field area.
+2. **Navigate:** drive to the next waypoint and stop within 5 m.
+3. **Drill:** lower the auger to a sampling depth of 10 to 13 cm.
+4. **Scoop:** a ceiling-mounted pantograph scoop lowers and grabs the drilled soil.
+5. **Measure:** read the sample with the spectrometer in a light-isolated chamber.
+6. **Eject:** dump the soil through a trapdoor so the next reading is clean.
+7. **Log:** save spectra, GPS position, and time.
+8. **Repeat** at the next waypoint, or return home.
+
+The emergency stop is live at every step (see [Hardware](#hardware)).
+
+### Software architecture (planned ROS 2 stack)
+
+The rover runs **ROS 2 Jazzy on a Raspberry Pi 5** and **micro-ROS on an
+ESP32**, linked over USB serial.
+
+```
+Raspberry Pi 5 (ROS 2 Jazzy)
+  LD19 driver ──/scan──▶ Nav2 (costmap + controller) ──/cmd_vel──▶ micro-ROS agent
+  IMU node ────/imu───▶ EKF (robot_localization) ──/odom──▶ Nav2
+  micro-ROS agent ──/wheel_odom──▶ EKF
+                         │ USB serial
+ESP32 (micro-ROS)        ▼
+  micro-ROS client (cmd_vel in, encoder ticks out)
+    ──▶ track mixer (v, ω to left/right speed) ──▶ motor I/O (PWM + encoders)
+```
+
+The touchscreen display connects to this stack through rosbridge (see
+[Touchscreen field display](#touchscreen-field-display-dirt-display)).
+
+> The Nav2, EKF, and micro-ROS packages and the ESP32 firmware are not in
+> this repository yet. See [Known issues and gaps](#known-issues-and-gaps).
+
+## Hardware
+
+| Subsystem | Part | Notes |
+| --- | --- | --- |
+| Compute | Raspberry Pi 5 | ROS 2 Jazzy, Nav2, EKF; hosts LiDAR, IMU, GPS, spectrometer, display |
+| Motor controller | ESP32-DevKitC | micro-ROS; motor PWM/DIR, encoders, e-stop relay |
+| Motor drivers | 2× Cytron MDD10A | One for the two tracks, one for the drill motors |
+| Drive | 2× REV HD Hex Motor + 40:1 spur gearbox | 150 RPM, 4.2 N·m stall; one per tank tread |
+| Battery | Renogy RBT1220LFP, 12.8 V 20 Ah LiFePO4 | 256 Wh, about 2.2 h at the 83 W high load; 20 A continuous limit |
+| LiDAR | LD19 | Obstacle scans for the Nav2 costmap |
+| IMU | ICM-20948 (breakout) | Heading and rates for the EKF, on Pi I2C |
+| GPS | NEO-M8N | Position tag for every sample, on Pi UART |
+| Spectrometer | StellarNet EPP2000-HR (NIR2) | 900 to 1075 nm, 2048-pixel CCD, USB 2.0 to the Pi 5 |
+
+**Power and safety.** Battery → ~20 A main fuse → power switch → e-stop relay →
+MDD10A drivers → motors. The 5 V logic rail (buck to the Pi 5, ESP32, and
+LiDAR) splits off after the power switch, so the computers stay on during a
+stop. Three things can open the relay: the red mushroom button on the hull, a
+remote STOP from the display or a phone (`/dirt/estop`), or a detected fault
+(drill stall, low battery, over-current, tip-over, lost comms). The stop
+latches until someone releases the button and does a manual reset. A software
+interlock blocks drilling while the tracks move, which keeps peak current under
+the battery's 20 A limit.
+
+Mechanical CAD is designed in SolidWorks. Reference parts are in [`CAD/`](CAD/).
+
+## Repository layout
+
+| Path | What it is |
+| --- | --- |
+| `main.py` | Mission and subsystem-test entry point |
+| `config.py` | All tunable parameters; `PLATFORM` switches between simulation and hardware |
+| `core/` | Vision alignment control loop and distance sensor support |
+| `navigation/` | GPS waypoint navigation and SLAM interface |
+| `spectrometer/` | Spectrometer driver, preprocessing, and PLS soil model, with a mock backend |
+| `simulation/dirt_sim_core.py` | Headless rover physics: terrain, skid-steer drive, REV motor model, mission state machine, CSV logs |
+| `simulation/rover_3d_panda.py` | Panda3D 3D viewer that renders `dirt_sim_core` |
+| `simulation/rover_3d_sim.py` | Older OpenCV-rendered 3D sim (replaced by the Panda3D viewer) |
+| `simulation/spectrometer_sim.py` | Spectrometer simulation with a matplotlib view |
+| `simulation/alignment_sim.py` | Alignment loop simulation with synthetic camera frames |
+| `DIRT Display/` | Touchscreen UI for the Pi 5, its ROS 2 helper node, and the Pi setup script |
+| `lm_models/` | PLS model notebooks (`PseudoMODEL.ipynb` and reference models) and an optional language-model loader |
+| `CAD/` | SolidWorks parts and assemblies (`MainAssem.SLDASM`, spectrometer box and elevator, motor box, spur gears) |
+| `Sim_Data/` | Reference simulation outputs |
+| `tests/` | pytest tests |
+| `w` | Example farm mission CSV for `main.py --mission` (columns `name,lat,lon,action,tolerance_m`) |
+| `fcntl.py` | Windows-only import shim (see known issues) |
+| `bench_rover_fps.py` | Frame-rate benchmark for the OpenCV sim |
 
 ## Setup
 
-Create and activate a virtual environment, then install the project
-dependencies:
+Requires **Python 3.10 or newer**. Panda3D is only needed for the 3D viewer.
+`RPi.GPIO` installs only on Linux. ROS 2 (`rclpy`) comes with ROS 2 Jazzy, not
+pip, and is only needed for the display helper node and the rover stack.
+
+Windows (PowerShell):
 
 ```powershell
 py -m venv .venv
@@ -42,12 +126,16 @@ py -m venv .venv
 python -m pip install -r requirements.txt
 ```
 
-On Linux or Raspberry Pi, use the equivalent activation command:
+Linux, macOS, or Raspberry Pi:
 
 ```bash
+python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
+
+Everything runs in simulation by default (`PLATFORM = Platform.SIMULATION` in
+`config.py`), so no hardware is needed to try it.
 
 ## Running the project
 
@@ -59,82 +147,87 @@ Run the complete simulated mission:
 python main.py
 ```
 
-Run a subsystem demonstration:
+Run a farm mission from a waypoint CSV:
+
+```bash
+python main.py --mission w
+```
+
+Run a single subsystem demo:
 
 ```bash
 python main.py --test alignment
 python main.py --test spectrometer
 python main.py --test distance
 python main.py --test navigation
+python main.py --test rover3d
 ```
 
-The real-hardware path is controlled by `config.py`. Review the configuration
-and platform settings before connecting hardware.
+For real hardware, set `PLATFORM` in `config.py` and check every pin and port
+there before connecting anything.
 
 ### Headless rover simulation
 
-Run one simulation:
+`simulation/dirt_sim_core.py` has no graphics dependency, so it also runs as a
+batch job on the TAMU HPRC Grace cluster.
 
 ```bash
+# One run
 python simulation/dirt_sim_core.py
-```
 
-Select terrain and control profiles:
+# Pick terrain and controller, write the log somewhere else
+python simulation/dirt_sim_core.py --terrain-mode rocky --control-mode aggressive --csv runs/rocky.csv
 
-```bash
-python simulation/dirt_sim_core.py \
-  --terrain-mode rocky \
-  --control-mode aggressive \
-  --csv runs/rocky.csv
-```
-
-Run all terrain and control combinations:
-
-```bash
+# Every terrain × controller combination
 python simulation/dirt_sim_core.py --batch --out sim_runs/
-```
 
-Generate deterministic random waypoints:
-
-```bash
+# Repeatable random sample sites
 python simulation/dirt_sim_core.py --random-waypoints 6 --seed 3
 ```
 
-Available terrain profiles are `farmland`, `grassland`, `rolling`, `dunes`,
-`rocky`, and `testyard`. Available control profiles are `smooth`, `pursuit`,
-and `aggressive`.
+Terrain profiles: `farmland`, `grassland`, `rolling`, `dunes`, `rocky`,
+`testyard`. Control profiles: `smooth`, `pursuit`, `aggressive`. Other useful
+flags: `--no-mission` (drive only, no drill or measure), `--mass`,
+`--sprocket-radius`, `--track-gauge`, `--max-time`, `--log-every`. Run with
+`--help` for the full list.
+
+Each run logs position, heading, speed, wheel slip, power draw, path curvature,
+and mission state to CSV.
 
 ### Panda3D 3D viewer
 
-Launch the interactive viewer:
-
 ```bash
 python simulation/rover_3d_panda.py
-```
-
-Useful options:
-
-```bash
-python simulation/rover_3d_panda.py --terrain-mode testyard
-python simulation/rover_3d_panda.py --camera overhead
+python simulation/rover_3d_panda.py --terrain-mode testyard --camera overhead
 python simulation/rover_3d_panda.py --headless --iters 600
 python simulation/rover_3d_panda.py --snapshot rover.png
 ```
 
-Viewer controls include:
+Cameras: `follow`, `overhead`, `cockpit`, `side`. Use `--resolution 1920x1080`
+on smaller screens (the default is 2560x1440).
 
-- Click: add a waypoint
-- `W` / `S`: throttle
-- `A` / `D`: steering
-- `M`: manual mode
-- `1`: autonomous waypoint mode
-- `2`: mission mode
-- `C`: change camera
-- `Space`: pause
-- `R`: reset
-- `Q`: quit
+| Key | Action |
+| --- | --- |
+| Click | Add a waypoint |
+| `W` / `S` | Throttle |
+| `A` / `D` | Steering |
+| `M` | Manual mode |
+| `1` | Autonomous waypoint mode |
+| `2` | Mission mode |
+| `C` | Change camera |
+| `Space` | Pause |
+| `R` | Reset |
+| `Q` | Quit |
 
-### Touchscreen field display
+### Spectrometer and alignment sims
+
+```bash
+python simulation/spectrometer_sim.py --soil loam
+python simulation/alignment_sim.py --no-gui
+python simulation/alignment_sim.py --sweep
+```
+
+### Touchscreen field display (`DIRT Display/`)
 
 `DIRT Display/` holds the touchscreen interface that runs on the rover's
 Raspberry Pi 5. It shows soil readings, temperatures, LiDAR, heading, drive
@@ -220,49 +313,62 @@ taps Take sample, and `/dirt/estop` (`std_msgs/Bool`) from the STOP button.
 firmware must subscribe to it and stop the motors, or the gate must be enabled.
 It is a backup to the physical e-stop, not a replacement.
 
-## Repository layout
+## Testing
 
-| Directory or file | Purpose |
-| --- | --- |
-| `core/` | Distance sensing and alignment-related core modules |
-| `navigation/` | GPS waypoint and navigation logic |
-| `simulation/` | Headless physics, alignment, spectrometer, and 3D simulations |
-| `spectrometer/` | Spectrometer interfaces and simulation support |
-| `lm_models/` | Optional language-model loading helpers |
-| `DIRT Display/` | Touchscreen field display, ROS 2 helper node, and Pi setup script |
-| `CAD/` | Mechanical CAD files and assemblies |
-| `Sim_Data/` | Simulation datasets and generated analysis data |
-| `tests/` | Automated tests |
-| `config.py` | Platform and hardware configuration |
-| `main.py` | Main mission and subsystem-test entry point |
-| `requirements.txt` | Python dependency declarations |
-
-## Testing and validation
-
-Run the test suite from the repository root:
+From the repository root:
 
 ```bash
-python -m pytest
+python -m pytest            # run the tests
+python -m compileall .      # syntax-check every module without running hardware or GUI code
 ```
 
-Compile-check all Python modules without running hardware or GUI code:
+Some tests and demos need Panda3D, a camera, or a display. Use the headless
+simulation on machines without one.
 
-```bash
-python -m compileall .
-```
+## Known issues and gaps
 
-Some tests and demonstrations require optional hardware, camera, display, or
-Panda3D functionality. Use the headless simulation for environments without a
-display.
+The PDR design has moved ahead of parts of this code. Before building on these
+modules, check them against the hardware table above.
 
-## Data and generated files
+- **Spectrometer driver does not match the hardware.** `spectrometer/spectrometer.py`
+  and `SpectrometerConfig` in `config.py` target an 18-band AS7265x over I2C
+  (410 to 940 nm). The rover uses a StellarNet EPP2000-HR over USB (900 to
+  1075 nm). The display also assumes a 400 to 1000 nm spectrum on
+  `/dirt/spectrometer/reflectance`.
+- **ROS 2 rover stack is not here yet.** Nav2 and EKF configs, launch files, the
+  LD19 and IMU nodes, and the ESP32 micro-ROS firmware still need to be added.
+- **Legacy hardware settings.** `config.py` still has camera, red-marker
+  alignment, HC-SR04, and direct Pi GPIO motor pins from the earlier concept.
+  The PDR design drives motors from the ESP32 through MDD10A drivers.
+- **`fcntl.py` at the repo root shadows Python's built-in `fcntl` on Linux.**
+  It is a Windows shim, but on the Pi it will break anything that needs the real
+  module (for example `pyserial`). Move it or only load it on Windows before
+  running on hardware.
+- **Repo cleanup.** `__pycache__/` folders are committed, root-level
+  `sim_*.csv` files duplicate `Sim_Data/`, and the mission file `w` has no
+  extension. A `.gitignore` at the root would keep generated files out.
+- **Display safety.** The on-screen STOP only publishes `/dirt/estop`. It is a
+  backup to the physical e-stop, not a replacement.
 
-The display's helper node writes samples to `~/dirt_samples/` on the Pi, not
-into the repository.
+## Contributing
 
-Simulation runs write CSV logs containing pose, terrain, motor, power, and
-mission data. Prefer writing new runs into a separate output directory such as
-`sim_runs/` rather than overwriting checked-in reference data.
+- Make changes on a branch and open a pull request into `main`.
+- Start every new file with a docstring that says what it does, and comment
+  any non-obvious math (drive model, track mixer, EKF settings, spectral
+  preprocessing).
+- Write simulation output to a folder like `sim_runs/`, not over the checked-in
+  reference data.
+- Never commit virtual environments, bytecode, API keys, or hardware
+  credentials.
+- Put design documents, test write-ups, and meeting notes in the Documentation
+  folder of the DIRT shared drive.
 
-Do not commit virtual environments, Python bytecode, API keys, or hardware
-credentials.
+## Team
+
+DIRT is a TURTLE Robotics R&D project at Texas A&M University.
+
+**Project Lead:** Kaleb Harris
+
+**Members:** Shourya Bhoomireddy, Chase Foster, Alexander Govea, Kekoa Iida,
+Nikhil Nagboth, Anna Nguyen, Kenneth Nguyen, Amu Panchangam, Isaac Ridlen,
+Chaitra Shenoy, Matthew Suprato, Andres Talamantes, Wenrui Xu
