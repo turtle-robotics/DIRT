@@ -1,3 +1,11 @@
+"""Frame-rate benchmark for the OpenCV rover sim (``simulation/rover_3d_sim.py``).
+
+Steps and renders the sim at 1280x720 for 3 seconds and prints frames, time
+and average FPS. Run from the repository root::
+
+    python bench_rover_fps.py
+"""
+
 import time
 from simulation.rover_3d_sim import Rover3DSim
 

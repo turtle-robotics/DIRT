@@ -559,6 +559,30 @@ body.touring main{padding-bottom:200px}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" async></script>
 <script>
+/*
+ * DIRT touchscreen display.
+ *
+ * One self-contained page (no build step) that runs full screen on the Pi 5 and
+ * can also be opened from a phone on the same network.
+ *
+ * Two data modes:
+ *   demo: fake data generated in this page, so the UI can be shown with no rover.
+ *   live: real data from the ROS 2 graph through rosbridge (plain WebSocket JSON,
+ *         default ws://<host>:9090). Add #live to the URL to start in live mode.
+ *
+ * Layout of this script:
+ *   Config       topic names, types and warning thresholds (edit these first)
+ *   state        the single state object S, plus small storage helpers
+ *   formatting   units, status chips, colours
+ *   canvas       chart, terrain, LiDAR, compass and map drawing
+ *   render*      one function per view, all driven from render()
+ *   demo data    fake sensors, spectrum, motion and LiDAR
+ *   live data    rosbridge connect / subscribe / route
+ *   e-stop       tap to stop, hold to release; a backup to the physical e-stop only
+ *   actions      samples, CSV export, settings
+ *
+ * Keep topic names in sync with the constants at the top of dirt_display_node.py.
+ */
 /* ===== Config: edit topic names / types to match the DIRT ROS 2 graph ===== */
 const SENSORS = {
   soilTemp:    {label:'Soil temp',        kind:'temp', topic:'/dirt/soil/temperature', type:'sensor_msgs/msg/Temperature', field:'temperature'},
@@ -624,10 +648,12 @@ const S = {
   estop: false, estopAt: 0, ack: new Set(), seenHot: new Set()
 };
 
+// Clear every live reading, history and rover state (used when switching between demo and live).
 function resetData() {
   S.val = {}; S.ts = {}; S.hist = {}; S.spectrum = null; S.pls = null; S.rx = {}; S.stats = null; S.logs = [];
   S.rover = {yaw: null, x: null, y: null, v: null, w: null, cmd: null, scan: null, path: [], dist: 0};
 }
+// Store a sensor reading and add it to that sensor's history (readings under 0.9 s apart replace the last point).
 function setVal(k, v, t = Date.now()) {
   if (typeof v !== 'number' || !isFinite(v)) return;
   S.val[k] = v; S.ts[k] = t;
@@ -635,12 +661,14 @@ function setVal(k, v, t = Date.now()) {
   if (h.length && t - h[h.length - 1].t < 900) h[h.length - 1] = {t, v};
   else { h.push({t, v}); if (h.length > HIST_MAX) h.shift(); }
 }
+// Update the rover position, add to the distance driven, and extend the path trail (every 5 cm, last 1500 points).
 function setPose(x, y, yaw) {
   const r = S.rover, p = r.path, last = p[p.length - 1];
   if (r.x != null) r.dist += Math.hypot(x - r.x, y - r.y);
   r.x = x; r.y = y; if (yaw != null) r.yaw = yaw;
   if (!last || Math.hypot(x - last.x, y - last.y) > .05) { p.push({x, y}); if (p.length > 1500) p.shift(); }
 }
+// Count a message on a topic; a 1 s timer turns the counts into the Hz shown on the System view.
 function noteRx(topic) { const r = S.rx[topic] || (S.rx[topic] = {n: 0, hz: 0, last: 0}); r.n++; r.last = Date.now(); }
 setInterval(() => { if (S.conn === 'demo') return; for (const t in S.rx) { const r = S.rx[t]; r.hz = r.hz * .5 + r.n * .5; r.n = 0; } }, 1000);
 const pick = (o, path) => path.split('.').reduce((a, p) => a == null ? a : a[p], o);
@@ -658,11 +686,13 @@ const silent = topic => !S.rx[topic] || Date.now() - S.rx[topic].last > SILENT_M
 
 // LiFePO4 12.8 V resting voltage to state of charge (approximate)
 const SOC = [[10.0,0],[12.0,9],[12.5,14],[12.8,17],[12.9,20],[13.0,30],[13.1,40],[13.2,70],[13.3,90],[13.4,99],[13.6,100]];
+// LiFePO4 resting voltage to state of charge, by linear interpolation in the SOC table above.
 function battPct(v) {
   if (v <= SOC[0][0]) return 0; if (v >= 13.6) return 100;
   for (let i = 1; i < SOC.length; i++) if (v <= SOC[i][0]) { const [v0,p0] = SOC[i-1], [v1,p1] = SOC[i]; return p0 + (p1 - p0) * (v - v0) / (v1 - v0); }
   return 100;
 }
+// Return [state, label] for a sensor, where state is ok / info / warn / hot / stale and sets the chip colour.
 function status(k) {
   const v = S.val[k], s = SENSORS[k];
   if (isStale(k)) return ['stale', 'No data'];
@@ -683,6 +713,7 @@ const timeStr = (t, sec = true) => { const d = new Date(t), p = n => String(n).p
 const deg = r => r * 180 / Math.PI;
 
 /* ===== canvas helpers ===== */
+// Size a canvas for the screen's pixel density and clear it. Returns {c, w, h} or null if it is hidden.
 function prep(cv) {
   const w = cv.clientWidth, h = cv.clientHeight; if (!w || !h) return null;
   const dpr = window.devicePixelRatio || 1;
@@ -690,7 +721,9 @@ function prep(cv) {
   const c = cv.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, w, h);
   return {c, w, h};
 }
+// Round up to a "nice" axis step: 1, 2 or 5 times a power of ten.
 function nice(x) { const p = 10 ** Math.floor(Math.log10(x)), f = x / p; return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * p; }
+// Draw one or more line series on a canvas. Options in o: axes, color, extra series, labels, bands, empty text.
 function drawChart(cv, ys, o = {}) {
   const P = prep(cv); if (!P) return; const {c, w, h} = P;
   const ink = css('--ink-dim'), line = css('--line'), font = css('--f-mono');
@@ -747,12 +780,14 @@ function wlLabels() {
   const span = SPECTRUM.wlEnd - SPECTRUM.wlStart;
   return [[0, SPECTRUM.wlStart + ' nm']].concat([.25, .5, .75].map(f => [f, String(Math.round(SPECTRUM.wlStart + f * span))]), [[1, SPECTRUM.wlEnd + ' nm']]);
 }
+// Shaded band around the 970 nm water absorption feature, if it falls inside the spectrum range.
 function waterBand() {
   const span = SPECTRUM.wlEnd - SPECTRUM.wlStart;
   return (970 > SPECTRUM.wlStart && 970 < SPECTRUM.wlEnd) ? [{from: (945 - SPECTRUM.wlStart) / span, to: Math.min(1, (995 - SPECTRUM.wlStart) / span), label: 'Water', color: css('--water')}] : [];
 }
 
 /* ===== topo contour ground (index line every 5th level) ===== */
+// Draw the topographic-contour background behind the whole UI.
 function drawTerrain() {
   const cv = $('#terrain'), w = innerWidth, h = innerHeight, dpr = window.devicePixelRatio || 1;
   cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
@@ -811,6 +846,7 @@ function renderTop() {
   const b = $('#estopBtn'); b.setAttribute('aria-pressed', String(S.estop)); b.textContent = S.estop ? 'STOPPED' : 'STOP';
 }
 
+// Build the list of active alerts (lost link, silent ESP32, low battery, hot parts, full disk).
 function computeAlerts() {
   const a = [];
   if (S.conn === 'offline') a.push({k: 'link', s: 'warn', t: 'Lost connection to the rover. Retrying rosbridge every 3 s.'});
@@ -826,6 +862,7 @@ function computeAlerts() {
   if (S.stats && S.stats.disk >= 90) a.push({k: 'disk', s: 'warn', t: `Pi storage is ${Math.round(S.stats.disk)}% full. Copy samples off soon.`});
   return a;
 }
+// Show the alert banners, skipping ones the user has dismissed, and beep the first time a part goes hot.
 function renderBanners() {
   const all = computeAlerts(), keys = new Set(all.map(x => x.k));
   [...S.ack].forEach(k => { if (!keys.has(k)) S.ack.delete(k); });
@@ -1029,11 +1066,13 @@ function renderSystem() {
   setChip($('#logChip'), errs ? ['hot', errs + ' errors, 10 min'] : ['ok', 'No errors']);
 }
 
+// Redraw the top bar, banners and whichever view is open. Called after every state change.
 function render() {
   renderTop(); renderBanners();
   if (!$('#settings').hidden) renderPhone();
   ({overview: renderOverview, soil: renderSoil, rover: renderRover, temps: renderTemps, samples: renderSamples, system: renderSystem})[S.view]();
 }
+// Switch to another view (overview, soil, rover, temps, samples, system).
 function go(v) {
   S.view = v;
   $$('.view').forEach(el => el.hidden = el.dataset.view !== v);
@@ -1059,6 +1098,7 @@ function terrainBase() {
 }
 const NOISE = {soilTemp: .05, ambientTemp: .15, soilMoisture: .18, soilPH: .012, soilEC: 5, battery: .004, batteryTemp: .08, cpuTemp: .9, motorL: .4, motorR: .4};
 let WORLD = {walls: true, xmin: -3.2, xmax: 3.2, ymin: -2.2, ymax: 2.2, obs: []}, PATH_A = 1.9, PATH_B = 1.05;
+// Make the demo arena: obstacles placed with a seeded random generator so each terrain always looks the same, kept clear of the elliptical demo path.
 function buildWorld() {
   const t = terrain(); PATH_A = t.ell[0]; PATH_B = t.ell[1];
   let seed = [...S.terrain].reduce((a, ch) => (a * 31 + ch.charCodeAt(0)) >>> 0, 7);
@@ -1081,7 +1121,9 @@ const DEMO_LOGS = [
   [30, 'controller_server', 'Control loop missed its desired rate of 20 Hz'], [20, 'dirt_display_node', 'Wrote sample row to samples_20261102.csv']
 ];
 let sim = {...BASE}, demoTimer = null, motionTimer = null, demoTick = 0, theta = 0;
+// Demo: drift each fake reading toward its base value with a little noise, and slowly drain the battery.
 function stepSim() { for (const k in sim) sim[k] += (BASE[k] - sim[k]) * .03 + (Math.random() - .5) * 2 * NOISE[k]; BASE.battery -= .0003; }
+// Demo: make a plausible soil reflectance curve, with dips for iron (~880 nm) and water (~970 nm) that deepen with moisture.
 function genSpectrum(wet = (sim.soilMoisture || 18) / 100) {
   const t = terrain(), n = Math.round((SPECTRUM.wlEnd - SPECTRUM.wlStart) / 5) + 1, out = [];
   for (let i = 0; i < n; i++) {
@@ -1093,6 +1135,7 @@ function genSpectrum(wet = (sim.soilMoisture || 18) / 100) {
   }
   return out;
 }
+// Demo LiDAR: distance along a ray to the arena walls or the nearest circular obstacle (Infinity if none).
 function rayDist(px, py, dx, dy) {
   let t = Infinity;
   if (WORLD.walls) {
@@ -1102,6 +1145,7 @@ function rayDist(px, py, dx, dy) {
   for (const [cx, cy, r] of WORLD.obs) { const ox = px - cx, oy = py - cy, b = ox * dx + oy * dy, cc = ox * ox + oy * oy - r * r, disc = b * b - cc; if (disc >= 0) { const s = -b - Math.sqrt(disc); if (s > 0) t = Math.min(t, s); } }
   return t;
 }
+// Demo: drive the rover around an ellipse (stopped while the e-stop is on) and fake a 180-ray LiDAR scan.
 function stepMotion(dt) {
   const r = S.rover, rate = S.estop ? 0 : .11;
   const prevYaw = r.yaw;
@@ -1120,6 +1164,7 @@ function demoRx() {
   SUBS.forEach(s => { if (s.event) return; S.rx[s.topic] = {n: 0, last: now, hz: (DEMO_HZ[s.topic] || 1) * (1 + (Math.random() - .5) * .06)}; });
   S.rx[SYS.rosout.topic] = {n: 0, hz: 0, last: S.logs[0] ? S.logs[0].t : now};
 }
+// Start demo mode: generate fake history, example samples and timers so the screen works with no rover.
 function startDemo() {
   stopLive(); clearInterval(demoTimer); clearInterval(motionTimer);
   S.conn = 'demo'; resetData(); buildWorld(); BASE = terrainBase(); sim = {...BASE}; theta = 0;
@@ -1150,12 +1195,15 @@ function startDemo() {
 
 /* ===== live data over rosbridge (plain WebSocket, no library, works offline on the Pi) ===== */
 let ws = null, retryT = null;
+// Send one rosbridge JSON message if the socket is open. Returns false otherwise.
 function send(o) { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(o)); return true; } return false; }
+// Leave demo mode, drop the example samples, and connect to rosbridge.
 function startLive() {
   clearInterval(demoTimer); clearInterval(motionTimer); demoTimer = motionTimer = null;
   resetData(); S.samples = S.samples.filter(s => !s.example); S.cmp = S.cmp.filter(n => S.samples.some(s => s.n === n));
   connect(); render();
 }
+// Open the rosbridge WebSocket, subscribe to every topic in SUBS, and advertise the topics this screen publishes.
 function connect() {
   stopLive(); S.conn = 'connecting'; renderTop();
   try { ws = new WebSocket(S.url); } catch (e) { S.conn = 'offline'; retry(); renderTop(); return; }
@@ -1171,6 +1219,7 @@ function connect() {
   ws.onclose = () => { ws = null; if (S.mode === 'live') { S.conn = 'offline'; retry(); render(); } };
   ws.onerror = () => {};
 }
+// Handle one incoming rosbridge message: update the matching sensor, rover, system or e-stop state.
 function route(topic, msg) {
   noteRx(topic);
   for (const k in SENSORS) if (SENSORS[k].topic === topic) setVal(k, Number(pick(msg, SENSORS[k].field)));
@@ -1197,17 +1246,22 @@ function route(topic, msg) {
     if (v !== S.estop) { S.estop = v; if (!v) { clearInterval(estopT); estopT = null; } }
   }
 }
+// Try to reconnect in 3 s (live mode only).
 function retry() { clearTimeout(retryT); retryT = setTimeout(() => { if (S.mode === 'live') connect(); }, 3000); }
+// Close the WebSocket without triggering the reconnect handler.
 function stopLive() { clearTimeout(retryT); if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} ws = null; } }
 
 /* ===== e-stop: tap to stop instantly, hold to release ===== */
 let estopT = null;
+// Publish true or false on the e-stop topic.
 function pubEstop(v) { return send({op: 'publish', topic: ESTOP.topic, msg: {data: v}}); }
+// Engage the e-stop and keep re-publishing true every ESTOP.repeatMs so a dropped message cannot release it.
 function engageEstop() {
   S.estop = true; S.estopAt = Date.now();
   pubEstop(true); clearInterval(estopT); estopT = setInterval(() => pubEstop(true), ESTOP.repeatMs);
   beep(); render();
 }
+// Release the e-stop (after the hold-to-release gesture), sending false three times to be sure it arrives.
 function releaseEstop() {
   S.estop = false; S.estopAt = Date.now(); clearInterval(estopT); estopT = null;
   [0, 200, 400].forEach(d => setTimeout(() => { if (!S.estop) pubEstop(false); }, d));
@@ -1226,6 +1280,7 @@ $('#estopBtn').addEventListener('click', () => { if (!S.estop) engageEstop(); })
 /* ===== alert sound ===== */
 let actx = null;
 document.addEventListener('pointerdown', () => { try { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch (e) {} }, {capture: true});
+// Two short 880 Hz beeps for alerts, if sound is on and the browser has allowed audio.
 function beep() {
   if (S.sound !== 'on' || !actx || actx.state !== 'running') return;
   try {
@@ -1239,7 +1294,9 @@ function beep() {
 
 /* ===== actions ===== */
 let toastT;
+// Show a short message at the bottom of the screen for 2.4 s.
 function toast(msg) { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toastT); toastT = setTimeout(() => t.hidden = true, 2400); }
+// Log a sample on screen and, when live, ask dirt_display_node to save it on the Pi.
 function takeSample(quiet = false) {
   const live = S.conn === 'live';
   if (live) send({op: 'publish', topic: SAMPLE_REQ.topic, msg: {}});
@@ -1249,11 +1306,13 @@ function takeSample(quiet = false) {
   if (!quiet) toast(live ? 'Sample requested. Saving on the Pi' : S.conn === 'demo' ? 'Demo sample logged' : 'Rover offline. Sample kept on this screen only');
   render();
 }
+// Return the on-screen samples as CSV text, oldest first.
 function toCSV() {
   const f = (v, d) => v == null ? '' : +v.toFixed(d);
   return ['n,time,x_m,y_m,soil_temp_C,moisture_vwc_pct,ph,ec_uS_cm,organic_carbon_pct,stored']
     .concat(S.samples.slice().reverse().map(s => [s.n, new Date(s.t).toISOString(), f(s.x, 3), f(s.y, 3), f(s.soilTemp, 2), f(s.soilMoisture, 2), f(s.soilPH, 3), f(s.soilEC, 0), f(s.soc, 3), s.example ? 'example' : s.saved ? 'pi' : 'screen'].join(','))).join('\n');
 }
+// Copy the samples CSV to the clipboard, with a fallback for browsers that block the clipboard API.
 function copyCSV() {
   const csv = toCSV();
   const fallback = () => { const ta = document.createElement('textarea'); ta.value = csv; document.body.appendChild(ta); ta.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (e) {} ta.remove(); toast(ok ? 'CSV copied' : 'Copy is blocked on this screen'); };

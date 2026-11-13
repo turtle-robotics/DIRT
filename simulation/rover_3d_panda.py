@@ -1,20 +1,27 @@
-"""
-DIRT Bot - 3D Rover Simulation (Panda3D viewer)
-===============================================
+"""DIRT 3D rover simulation (Panda3D viewer).
 
-Draws the simulation from dirt_sim_core.py in 3D. All motion, control,
+Draws the simulation from ``dirt_sim_core.py`` in 3D. All motion, control,
 mission and logging logic lives in the core; this file only renders it and
-handles keyboard/mouse input, so the CSV you get from the viewer and from a
-headless run of the same scenario come from the exact same model.
+handles keyboard and mouse input, so the CSV you get from the viewer and from
+a headless run of the same scenario come from the exact same model.
 
-    python rover3d_panda.py                          # interactive viewer
-    python rover3d_panda.py --terrain-mode rocky --control-mode aggressive
-    python rover3d_panda.py --terrain-mode testyard  # ramps from 5 to 40 deg
-    python rover3d_panda.py --headless               # no window (same as dirt_sim_core.py)
-    python rover3d_panda.py --snapshot shot.png      # render a frame and exit
+Run from the ``simulation/`` folder (this file imports ``dirt_sim_core``
+directly, not as ``simulation.dirt_sim_core``)::
+
+    python rover_3d_panda.py                          # interactive viewer
+    python rover_3d_panda.py --terrain-mode rocky --control-mode aggressive
+    python rover_3d_panda.py --terrain-mode testyard  # ramps from 5 to 40 deg
+    python rover_3d_panda.py --headless               # no window (same as dirt_sim_core.py)
+    python rover_3d_panda.py --snapshot shot.png      # render a frame and exit
 
 Controls: click to add a waypoint, W/S throttle, A/D steer, M manual,
-1 auto, 2 mission on/off, C camera, Space pause, R reset, X zero input, Q quit.
+1 auto, 2 mission on/off, C camera, Space pause, R reset, X zero input,
+F12 snapshot, Q or Esc quit.
+
+Frame loop: each rendered frame runs as many fixed ``SIM_DT`` physics steps
+as real time has passed (at most ``MAX_SUBSTEPS``), then moves the 3D model
+to match the sim state. Physics results therefore do not depend on the frame
+rate.
 """
 
 from __future__ import annotations
@@ -100,6 +107,8 @@ PROBE_TRAVEL_M = 0.95         # measurement probe drop to touch the soil
 # --------------------------------------------------------------------------
 
 def _lerp(value: float, target: float, alpha: float) -> float:
+    """Move ``value`` a fraction ``alpha`` (clamped to 0..1) of the way toward ``target``.
+    """
     return value + (target - value) * clamp(alpha, 0.0, 1.0)
 
 
@@ -118,6 +127,7 @@ def normalize_resolution(value) -> Tuple[int, int]:
 
 
 def clamp_target_fps(value: float) -> float:
+    """Clamp the render rate to 30..240 fps. 0 or negative gives 90."""
     fps = float(value)
     if fps <= 0:
         return 90.0
@@ -125,6 +135,12 @@ def clamp_target_fps(value: float) -> float:
 
 
 def lighting_profile(terrain_mode: str) -> dict:
+    """Return light, background and fog colours for a terrain.
+
+    Keys: ``ambient``, ``sun_color``, ``fill_color``, ``background`` (RGBA),
+    ``fog_color`` (RGB) and ``fog_density``. Unknown terrains get a neutral
+    default.
+    """
     if terrain_mode == "testyard":
         return {
             "ambient": (0.36, 0.36, 0.38, 1.0),
@@ -172,6 +188,7 @@ def lighting_profile(terrain_mode: str) -> dict:
 
 
 def weather_profile(terrain_mode: str) -> dict:
+    """Return the sun glow colour and cloud opacity for a terrain."""
     return {
         "farmland": {"sun_glow": (1.00, 0.80, 0.46), "cloud_alpha": 0.30},
         "dunes": {"sun_glow": (1.00, 0.86, 0.60), "cloud_alpha": 0.22},
@@ -183,6 +200,10 @@ _FORMATS: Dict[Tuple[bool, bool], GeomVertexFormat] = {}
 
 
 def _vertex_format(with_color: bool, with_uv: bool):
+    """Return (and cache) a Panda3D vertex format: position and normal, plus optional colour and UV.
+
+    The column order must match the order ``build_mesh`` stacks its arrays in.
+    """
     key = (with_color, with_uv)
     if key not in _FORMATS:
         array = GeomVertexArrayFormat()
@@ -228,6 +249,8 @@ def build_mesh(
 
 
 def _unit_box_geom() -> Geom:
+    """Build a 1 x 1 x 1 box centred on the origin. Every box part shares this one mesh and is scaled per node.
+    """
     faces = [
         ((0, 0, 1), [(-.5, -.5, .5), (.5, -.5, .5), (.5, .5, .5), (-.5, .5, .5)]),
         ((0, 0, -1), [(-.5, .5, -.5), (.5, .5, -.5), (.5, -.5, -.5), (-.5, -.5, -.5)]),
@@ -265,6 +288,12 @@ def _rgba_texture(name: str, rgba: np.ndarray, repeat: bool = False) -> Texture:
 # --------------------------------------------------------------------------
 
 class Rover3DPandaApp(ShowBase):
+    """The Panda3D window: builds the scene, runs the sim, draws it every frame.
+
+    The ``RoverSim`` is in ``self.sim``. Panda3D uses +Y as forward; the sim and
+    the rover model use +X, so the model is turned 90 degrees inside its pose node.
+    """
+
     def __init__(
         self,
         waypoints: Optional[Sequence[Waypoint3D]] = None,
@@ -283,6 +312,20 @@ class Rover3DPandaApp(ShowBase):
         mission_mode: Optional[bool] = None,
         exit_on_complete: bool = False,
     ):
+        """Open the window, build the scene and HUD, and start the update task.
+
+        Args:
+            waypoints, terrain_span_m, waypoint_tolerance_m, max_speed_mps,
+            steering_gain, accel_mps2, control_mode, terrain_mode, run_label, params:
+                Passed to ``RoverSim``.
+            max_steps: Quit after this many physics steps. None runs until done or quit.
+            display_resolution: Window size as (w, h) or ``"WxH"``.
+            target_fps: Render rate cap.
+            mission_mode: Passed to ``RoverSim``. Note that None is treated as off
+                there (``RoverSim`` only checks truthiness), so pass True to run the
+                drill and measure sequence.
+            exit_on_complete: Close the window when the route is finished.
+        """
         self.display_resolution = normalize_resolution(display_resolution)
         self.target_fps = clamp_target_fps(target_fps)
         # Size the window up front; requesting it later leaves the first
@@ -356,19 +399,24 @@ class Rover3DPandaApp(ShowBase):
     # Convenience pass-throughs so older code that poked at the app still works.
     @property
     def state(self) -> RoverState:
+        """The sim's ``RoverState`` (kept for older code)."""
         return self.sim.state
 
     @property
     def waypoints(self) -> List[Waypoint3D]:
+        """The sim's waypoint list (kept for older code)."""
         return self.sim.waypoints
 
     @property
     def log(self) -> MotionLog:
+        """The sim's ``MotionLog`` (kept for older code)."""
         return self.sim.log
 
     # ------------------------------------------------------------- input
 
     def _bind_controls(self) -> None:
+        """Map keys and the mouse to their actions (see the module docstring for the list).
+        """
         self.accept("escape", self._request_quit)
         self.accept("q", self._request_quit)
         self.accept("m", self.toggle_manual_mode)
@@ -385,33 +433,42 @@ class Rover3DPandaApp(ShowBase):
             self.accept(f"{key}-up", self._set_key, [key, False])
 
     def _set_key(self, key: str, value: bool) -> None:
+        """Record whether a W/A/S/D key is held."""
         self._keys[key] = value
 
     def _request_quit(self) -> None:
+        """Ask the update task to close the window on its next frame."""
         self._quit_requested = True
 
     def toggle_manual_mode(self) -> None:
+        """Switch between keyboard driving and autonomous driving."""
         self.sim.manual_mode = not self.sim.manual_mode
 
     def toggle_pause(self) -> None:
+        """Pause or resume the physics (the scene keeps rendering)."""
         self.paused = not self.paused
 
     def zero_manual_input(self) -> None:
+        """Set the manual throttle and steering back to 0."""
         self.sim.manual_throttle = 0.0
         self.sim.manual_steer = 0.0
 
     def _set_auto_mode(self) -> None:
+        """Leave manual mode and clear the manual input."""
         self.sim.manual_mode = False
         self.zero_manual_input()
 
     def _toggle_mission_mode(self) -> None:
+        """Turn the drill/measure sequence on or off."""
         self.sim.set_mission_mode(not self.sim.mission_mode)
 
     def _cycle_camera(self) -> None:
+        """Step through the camera views: follow, overhead, cockpit, side."""
         modes = ("follow", "overhead", "cockpit", "side")
         self._camera_mode = modes[(modes.index(self._camera_mode) + 1) % len(modes)]
 
     def reset_pose(self) -> None:
+        """Reset the sim and clear the tread trail and obstacle highlights."""
         self.sim.reset()
         self.finished = False
         self._trail_points.clear()
@@ -448,6 +505,11 @@ class Rover3DPandaApp(ShowBase):
         return None
 
     def _place_waypoint(self) -> None:
+        """Add a waypoint where the mouse click hits the ground.
+
+        Casts a ray from the camera through the mouse position, finds where it meets
+        the terrain, and ignores clicks outside the reachable area.
+        """
         if not self.mouseWatcherNode.hasMouse():
             return
         mouse = self.mouseWatcherNode.getMouse()
@@ -470,6 +532,7 @@ class Rover3DPandaApp(ShowBase):
     # ------------------------------------------------------------- building
 
     def _build_box(self, name: str, color) -> NodePath:
+        """Make a coloured node that uses the shared unit box mesh."""
         node = GeomNode(name)
         node.addGeom(self._box_geom)  # shared geometry, per-node transform/colour
         np_node = NodePath(node)
@@ -477,6 +540,8 @@ class Rover3DPandaApp(ShowBase):
         return np_node
 
     def _apply_material(self, node: NodePath, diffuse, ambient, specular, shininess: float) -> None:
+        """Give a node a lit material (diffuse, ambient, specular colours and shininess).
+        """
         material = Material()
         material.setDiffuse(diffuse)
         material.setAmbient(ambient)
@@ -485,6 +550,17 @@ class Rover3DPandaApp(ShowBase):
         node.setMaterial(material, 1)
 
     def _part(self, parent: NodePath, name: str, scale, pos, diffuse, ambient, specular, shininess, hpr=None) -> NodePath:
+        """Add one box part to the model: scaled, positioned, optionally rotated, with a material.
+
+        Args:
+            parent: Node to attach to.
+            name: Node name.
+            scale: (x, y, z) size in metres.
+            pos: (x, y, z) centre relative to the parent.
+            diffuse, ambient, specular: RGBA colours.
+            shininess: Specular exponent; higher is a tighter highlight.
+            hpr: Optional (heading, pitch, roll) in degrees.
+        """
         part = self._build_box(name, diffuse)
         part.reparentTo(parent)
         part.setScale(*scale)
@@ -495,6 +571,8 @@ class Rover3DPandaApp(ShowBase):
         return part
 
     def _build_scene(self) -> None:
+        """Build everything in the world once: lights, sky, terrain, ground cover, rover, obstacles, waypoints.
+        """
         self._setup_lights()
         self._sky_np = self._make_sky_dome()
         self.terrain_np = self._make_terrain()
@@ -505,6 +583,8 @@ class Rover3DPandaApp(ShowBase):
         self._rebuild_waypoint_visuals()
 
     def _setup_lights(self) -> None:
+        """Add fog, ambient light, a sun and a fill light using the terrain's lighting profile.
+        """
         self.render.setShaderAuto()
         profile = lighting_profile(self.terrain_mode)
 
@@ -532,6 +612,12 @@ class Rover3DPandaApp(ShowBase):
         self.setBackgroundColor(*profile["background"])
 
     def _terrain_colors(self, gx: np.ndarray, gy: np.ndarray, z: np.ndarray) -> np.ndarray:
+        """Return an RGB colour for every terrain grid point.
+
+        The test yard is grey concrete with a 2 m grid and ramps coloured green to
+        yellow to red by angle. Farmland is striped to match the furrow ridges. Other
+        terrains blend from a low colour to a high colour by height.
+        """
         height_t = np.clip((z + 0.8) / 1.7, 0.0, 1.0)[..., None]
         mode = self.terrain_mode
         if mode == "testyard":
@@ -622,6 +708,8 @@ class Rover3DPandaApp(ShowBase):
         half = self.terrain.span_m / 2.0 - 1.0
 
         def tuft(x: float, y: float, height: float, color, lean: float) -> None:
+            """Place one thin box as a crop or grass tuft at (x, y), sitting on the ground.
+            """
             node = self._build_box("tuft", color)
             node.reparentTo(root)
             node.setScale(0.05, 0.05, height)
@@ -692,6 +780,7 @@ class Rover3DPandaApp(ShowBase):
             self._build_testyard_signs()
 
     def _build_testyard_signs(self) -> None:
+        """Put a label post showing the angle at both ends of each test yard ramp."""
         for angle, yc in testyard_lanes():
             for x in (-TESTYARD_RUNUP_X - 2.2, TESTYARD_RUNUP_X + 2.2):
                 post = self._build_box("sign-post", (0.30, 0.30, 0.32, 1.0))
@@ -713,6 +802,11 @@ class Rover3DPandaApp(ShowBase):
                 label.setFogOff(1)
 
     def _make_sky_dome(self, radius: float = 140.0, slices: int = 48, stacks: int = 24) -> NodePath:
+        """Build a half-sphere sky with a zenith-to-horizon colour gradient.
+
+        The dome follows the rover each frame and is drawn first with lighting, fog
+        and depth writes off, so it always sits behind everything.
+        """
         phi = np.linspace(0.0, math.pi / 2.0, stacks + 1)
         theta = np.linspace(0.0, 2.0 * math.pi, slices + 1)
         th, ph = np.meshgrid(theta, phi)
@@ -748,6 +842,8 @@ class Rover3DPandaApp(ShowBase):
         return sky_np
 
     def _make_soft_disc_texture(self, name: str, core, edge) -> Texture:
+        """Make a round texture that fades from ``core`` colour in the middle to ``edge`` at the rim (smoothstep falloff).
+        """
         size = 128
         idx = (np.arange(size) - 63.5) / 63.5
         gx, gy = np.meshgrid(idx, idx)
@@ -762,6 +858,8 @@ class Rover3DPandaApp(ShowBase):
         return _rgba_texture(name, rgba)
 
     def _make_billboard_sprite(self, name: str, texture: Texture, scale: float, color) -> NodePath:
+        """Make a flat textured card that always faces the camera (used for the sun and clouds).
+        """
         card = CardMaker(name)
         card.setFrame(-1.0, 1.0, -1.0, 1.0)
         node = self.render.attachNewNode(card.generate())
@@ -778,6 +876,7 @@ class Rover3DPandaApp(ShowBase):
         return node
 
     def _build_sky_sprites(self) -> None:
+        """Create the sun disc and three clouds using the terrain's weather profile."""
         weather = weather_profile(self.terrain_mode)
         glow = weather["sun_glow"]
         sun_texture = self._make_soft_disc_texture("sun", glow, (*glow, 0.0))
@@ -920,6 +1019,7 @@ class Rover3DPandaApp(ShowBase):
         self._shadow_np.setPosHpr(0.0, 0.0, 0.02, 0.0, -90.0, 0.0)
 
     def _make_rover_shadow(self) -> NodePath:
+        """Make a soft dark rectangle under the rover as a cheap shadow."""
         card = CardMaker("rover-shadow")
         card.setFrame(-1.15, 1.15, -1.2, 1.2)
         shadow = self.render.attachNewNode(card.generate())
@@ -934,6 +1034,8 @@ class Rover3DPandaApp(ShowBase):
     # ------------------------------------------------------------- obstacles
 
     def _spawn_field_obstacles(self) -> None:
+        """Build a 3D tree or rock for every obstacle in the sim and set it on the ground.
+        """
         for obs in self.sim.obstacles:
             node = self._build_tree(obs.name, obs.scale) if obs.kind == "tree" else self._build_rock(obs.name, obs.scale)
             node.setPos(obs.x, obs.y, float(self.terrain.height(obs.x, obs.y)))
@@ -941,6 +1043,8 @@ class Rover3DPandaApp(ShowBase):
             self._obstacle_nodes[obs.name] = node
 
     def _build_tree(self, name: str, scale: float) -> NodePath:
+        """Build a simple tree from boxes (trunk, two branches, four canopy blocks), sized by ``scale``.
+        """
         root = self.render.attachNewNode(name)
         bark = ((0.40, 0.26, 0.12, 1.0), (0.16, 0.10, 0.05, 1.0), (0.52, 0.34, 0.18, 1.0))
         self._part(root, "trunk", (0.14 * scale, 0.14 * scale, 0.72 * scale), (0.0, 0.0, 0.32 * scale), *bark, 10.0,
@@ -963,6 +1067,7 @@ class Rover3DPandaApp(ShowBase):
         return root
 
     def _build_rock(self, name: str, scale: float) -> NodePath:
+        """Build a rock from three rotated boxes, sized by ``scale``."""
         root = self.render.attachNewNode(name)
         self._part(root, "base", (0.60 * scale, 0.48 * scale, 0.32 * scale), (0.0, 0.0, 0.10 * scale),
                    (0.40, 0.38, 0.34, 1.0), (0.12, 0.12, 0.12, 1.0), (0.60, 0.58, 0.54, 1.0), 24.0, hpr=(8.0, -8.0, 14.0))
@@ -975,6 +1080,7 @@ class Rover3DPandaApp(ShowBase):
     # ------------------------------------------------------------- waypoints
 
     def _waypoint_colour(self, idx: int):
+        """Grey for done, teal for the current target, yellow for queued."""
         if idx < self.sim.target_idx:
             return (0.45, 0.48, 0.50, 1.0)      # done
         if idx == self.sim.target_idx:
@@ -982,6 +1088,8 @@ class Rover3DPandaApp(ShowBase):
         return (0.86, 0.90, 0.34, 1.0)          # queued
 
     def _rebuild_waypoint_visuals(self) -> None:
+        """Recreate every waypoint marker and the route line that follows the ground between them.
+        """
         for marker in self.waypoint_nodes:
             marker.removeNode()
         self.waypoint_nodes.clear()
@@ -1018,12 +1126,15 @@ class Rover3DPandaApp(ShowBase):
             self._route_np.setTransparency(TransparencyAttrib.MAlpha)
 
     def _refresh_waypoints(self) -> None:
+        """Recolour the markers when the target changes, without rebuilding them."""
         for idx, node in enumerate(self.waypoint_nodes):
             node.setColor(*self._waypoint_colour(idx))
 
     # ------------------------------------------------------------- HUD
 
     def _build_hud(self) -> None:
+        """Create the on-screen telemetry text, the controls line and the centre banner.
+        """
         self.hud = OnscreenText(
             text="", parent=self.a2dTopLeft, align=TextNode.ALeft, pos=(0.05, -0.07), scale=0.045,
             fg=(0.98, 0.98, 0.98, 1.0), mayChange=True, shadow=(0.05, 0.05, 0.05, 0.9),
@@ -1039,6 +1150,8 @@ class Rover3DPandaApp(ShowBase):
         )
 
     def _update_hud(self) -> None:
+        """Refresh the telemetry text and show a banner when the route or test yard run is finished.
+        """
         sim, s, p = self.sim, self.sim.state, self.sim.params
         target = sim.current_waypoint()
         distance, bearing = sim.target_geometry()
@@ -1072,6 +1185,8 @@ class Rover3DPandaApp(ShowBase):
             self.banner.setText("")
 
     def _ramp_hud_line(self) -> str:
+        """Test yard only: which ramp the rover is on and the max pitch so far. Empty string elsewhere.
+        """
         if self.terrain_mode != "testyard":
             return ""
         s = self.sim.state
@@ -1081,6 +1196,11 @@ class Rover3DPandaApp(ShowBase):
         return f"Test yard: {on}   max pitch so far {self.sim.max_abs_pitch_deg:.1f} deg{failed}\n"
 
     def _scan_obstacles(self) -> None:
+        """Highlight obstacles the rover can "see" and find the nearest one.
+
+        Visible means within 11 m and within 72 degrees of straight ahead. This is
+        display only; the sim's avoidance uses its own range check.
+        """
         s = self.sim.state
         nearest_name, nearest_distance = None, float("inf")
         for obs in self.sim.obstacles:
@@ -1101,6 +1221,12 @@ class Rover3DPandaApp(ShowBase):
     # ------------------------------------------------------------- per frame
 
     def _sync_scene(self, frame_dt: float) -> None:
+        """Move every 3D node to match the current sim state.
+
+        Sets the rover pose (heading, then pitch, then roll), scrolls the tread
+        cleats by each tread's distance travelled, moves the drill and probe, keeps
+        the sky and clouds around the rover, then updates the camera, trail and HUD.
+        """
         sim, s = self.sim, self.sim.state
         h, p, r = math.radians(s.heading_deg), math.radians(s.pitch_deg), math.radians(s.roll_deg)
 
@@ -1139,6 +1265,11 @@ class Rover3DPandaApp(ShowBase):
         self._render_frame += 1
 
     def _update_camera(self, frame_dt: float) -> None:
+        """Move the camera toward the selected view.
+
+        Smoothing uses ``1 - exp(-6 * dt)`` so the camera settles at the same speed
+        whatever the frame rate.
+        """
         s = self.sim.state
         h = math.radians(s.heading_deg)
         if self._camera_mode == "overhead":
@@ -1169,6 +1300,11 @@ class Rover3DPandaApp(ShowBase):
         self.camera.lookAt(Point3(self._camera_target))
 
     def _update_trail(self) -> None:
+        """Add tread marks behind the rover and redraw them when they change.
+
+        A new pair of points (one under each tread) is added every 0.12 m, and only
+        the last ``TRAIL_MAX_POINTS`` are kept.
+        """
         s = self.sim.state
         if not self._trail_points or math.hypot(s.x - self._trail_points[-1][0], s.y - self._trail_points[-1][1]) > 0.12:
             h = math.radians(s.heading_deg)
@@ -1203,6 +1339,8 @@ class Rover3DPandaApp(ShowBase):
         self._trail_np = root
 
     def _read_manual_keys(self) -> None:
+        """Turn held W/A/S/D keys into throttle and steer, eased in so they do not jump.
+        """
         throttle = (1.0 if self._keys["w"] else 0.0) - (1.0 if self._keys["s"] else 0.0)
         steer = (1.0 if self._keys["a"] else 0.0) - (1.0 if self._keys["d"] else 0.0)
         alpha = SIM_DT * 4.5
@@ -1210,6 +1348,14 @@ class Rover3DPandaApp(ShowBase):
         self.sim.manual_steer = _lerp(self.sim.manual_steer, steer, alpha)
 
     def _update_task(self, task):
+        """Per-frame task: run the fixed-step physics, then redraw.
+
+        Real elapsed time (capped at 0.1 s) goes into an accumulator, and one
+        ``SIM_DT`` step runs for each ``SIM_DT`` of it, up to ``MAX_SUBSTEPS``. If
+        the computer cannot keep up, the leftover time is dropped so the sim slows
+        down instead of falling further and further behind. Also handles the
+        snapshot, ``max_steps`` and ``exit_on_complete``.
+        """
         if self._quit_requested:
             self.userExit()
             return task.done
@@ -1248,6 +1394,15 @@ class Rover3DPandaApp(ShowBase):
     # ------------------------------------------------------------- output
 
     def capture_snapshot(self, path: Optional[str] = None) -> bool:
+        """Save the window as an image.
+
+        Args:
+            path: Output file. Falls back to the --snapshot path, then
+                ``rover_snapshot.png``.
+
+        Returns:
+            True if the file was saved.
+        """
         output_path = path or self._snapshot_path or "rover_snapshot.png"
         if self.win is None:
             log.warning("Snapshot skipped because no window is available")
@@ -1262,6 +1417,7 @@ class Rover3DPandaApp(ShowBase):
         return bool(saved)
 
     def save_path_csv(self, path: str = "sim_rover_3d_path.csv") -> None:
+        """Write the sim's path log to ``path``."""
         self.sim.log.save_csv(path)
 
 
@@ -1331,6 +1487,7 @@ def run_rover_3d_demo(
 
 
 def main() -> None:
+    """Command-line entry point. Run with ``--help`` for the options."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
     parser = argparse.ArgumentParser(description="DIRT rover 3D simulation (Panda3D)")
     add_common_args(parser)

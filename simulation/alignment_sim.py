@@ -92,6 +92,20 @@ class SyntheticCamera:
     MARKER_SEP    = 80   # pixels between the two markers
 
     def render(self, pose: RobotPose, noise_px: float = 1.0) -> np.ndarray:
+        """Draw one fake camera frame.
+
+        The two markers sit ``MARKER_SEP`` px apart, centred at the frame centre plus
+        the pose offset and rotated by ``pose.angle_deg``. Each marker centre gets
+        ``noise_px`` of jitter, and the whole image gets pixel noise with sigma
+        ``2 * noise_px``.
+
+        Args:
+            pose: Current simulated misalignment.
+            noise_px: Noise level. 0 gives a clean image.
+
+        Returns:
+            A BGR image the same size as the real camera frame.
+        """
         frame = np.zeros((self.H, self.W, 3), dtype=np.uint8)
         frame[:] = (40, 35, 30)   # Dark soil-ish background
 
@@ -130,9 +144,14 @@ class SyntheticCamera:
 
 @dataclass
 class ConvergenceLog:
+    """Rows of detector output and true pose, one per iteration, for plotting or the PDR report.
+    """
+
     rows: List[dict] = field(default_factory=list)
 
     def record(self, iteration: int, data: AlignmentData, pose: RobotPose):
+        """Add one row: what the detector measured and where the simulated box really was.
+        """
         self.rows.append({
             "iteration":   iteration,
             "x_offset_px": round(data.x_offset, 2),
@@ -146,6 +165,7 @@ class ConvergenceLog:
         })
 
     def save_csv(self, path: str = "sim_convergence.csv"):
+        """Write all rows to ``path`` (overwrites it). Needs at least one row."""
         with open(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=self.rows[0].keys())
             w.writeheader()
@@ -153,6 +173,7 @@ class ConvergenceLog:
         log.info("Convergence log saved → %s", path)
 
     def print_summary(self):
+        """Print iteration count, final errors and whether alignment was reached."""
         if not self.rows:
             print("No data recorded.")
             return
@@ -173,6 +194,13 @@ class LivePlot:
     """Draws an error-vs-iteration strip chart in a separate OpenCV window."""
 
     def __init__(self, w: int = 640, h: int = 300, max_iter: int = 100):
+        """Create an empty chart.
+
+        Args:
+            w: Width in pixels.
+            h: Height in pixels.
+            max_iter: Expected number of iterations (stored for reference).
+        """
         self.w, self.h   = w, h
         self.max_iter    = max_iter
         self.x_hist: List[float] = []
@@ -180,11 +208,18 @@ class LivePlot:
         self.r_hist: List[float] = []
 
     def update(self, data: AlignmentData):
+        """Append the latest X, Y and rotation errors."""
         self.x_hist.append(data.x_offset)
         self.y_hist.append(data.y_offset)
         self.r_hist.append(data.rotation_angle)
 
     def render(self) -> np.ndarray:
+        """Draw the chart and return it as an image.
+
+        The vertical scale is fixed at +/-150 (px for X/Y, degrees for rotation) and
+        the X history is stretched to fill the width. The green box shows the X
+        tolerance band.
+        """
         canvas = np.zeros((self.h, self.w, 3), dtype=np.uint8)
         canvas[:] = (20, 20, 20)
 
@@ -198,6 +233,8 @@ class LivePlot:
             return canvas
 
         def _to_y(v):
+            """Map an error value to a pixel row (0 at the middle, +150 near the top).
+            """
             return int(mid - (v / max_val) * (self.h * 0.45))
 
         step = max(1, self.w // max(n, 1))
@@ -244,8 +281,26 @@ def run_simulation(
     save_csv: bool  = True,
     delay_ms: int   = 50,
 ) -> ConvergenceLog:
-    """
-    Run one simulation scenario and return the convergence log.
+    """Run one simulation scenario and return the convergence log.
+
+    Each iteration renders a frame at the current pose, runs the real
+    ``AlignmentDetector`` and ``ControlLaw`` on it, and moves the simulated pose
+    by the resulting command (with noise). Stops when aligned, after ``max_iter``
+    iterations, or when q is pressed in the video window.
+
+    Args:
+        init_x: Starting X error in pixels.
+        init_y: Starting Y error in pixels.
+        init_rot: Starting rotation error in degrees.
+        noise_px: Image and marker noise. Motion noise is half of this.
+        max_iter: Maximum iterations.
+        show_video: Show the camera view and error plot windows.
+        save_csv: Write ``sim_convergence.csv`` to the current folder.
+        delay_ms: Pause between frames when showing video.
+
+    Returns:
+        The ``ConvergenceLog``. Iterations where no markers were detected are
+        not recorded.
     """
     pose     = RobotPose(init_x, init_y, init_rot)
     camera   = SyntheticCamera()
@@ -311,9 +366,10 @@ def run_simulation(
 
 
 def run_parameter_sweep():
-    """
-    Sweep over initial offsets and noise levels to characterise system robustness.
-    Outputs a CSV table – good for PDR slides.
+    """Sweep over initial offsets and noise levels to characterise system robustness.
+
+    Runs four scenarios (easy, nominal, hard, extreme) headless, prints a table,
+    and writes ``sim_sweep.csv`` to the current folder. Good for PDR slides.
     """
     results = []
     configs = [

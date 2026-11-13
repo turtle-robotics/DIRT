@@ -1,4 +1,22 @@
-"""DIRT Bot navigation stack."""
+"""DIRT navigation: GPS waypoints, local pose, and the per-waypoint state machine.
+
+Pieces:
+
+* ``GPSCoord`` / ``GPSReceiver``: GPS position from NMEA sentences on a
+  serial port, or a mock that slowly walks north-east in simulation.
+* ``SLAMInterface``: local x/y/yaw pose. Right now this is dead reckoning only;
+  the ROS 2 branch is a stub.
+* ``Navigator``: steps through waypoints. For each one the state goes
+  GPS_NAVIGATE -> SLAM_LOCALISE -> ALIGNING -> DRILLING -> MEASURING, then on
+  to the next waypoint, and DONE after the last one.
+
+Other subsystems move the state machine forward by calling
+``notify_aligned``, ``notify_drill_complete`` and ``notify_measure_complete``.
+
+On the rover, Nav2 and the EKF (robot_localization) in the ROS 2 stack will
+take over driving and localisation; this module is the Python-side mission
+sequencer and simulation stand-in.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +37,16 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class GPSCoord:
+    """A GPS fix in decimal degrees.
+
+    Attributes:
+        lat: Latitude, positive north.
+        lon: Longitude, positive east (College Station is about -96.3).
+        alt: Altitude in metres (not filled in by the parser yet).
+        hdop: Horizontal dilution of precision. Lower is better; 99.9 means unknown.
+        fix: True if the receiver reported a valid fix.
+    """
+
     lat: float
     lon: float
     alt: float = 0.0
@@ -50,6 +78,14 @@ class GPSCoord:
 
 @dataclass
 class Pose2D:
+    """Local pose in metres and degrees.
+
+    Attributes:
+        x: East-ish position in metres from the start point.
+        y: North-ish position in metres from the start point.
+        yaw: Heading in degrees, kept in 0..360.
+    """
+
     x: float = 0.0
     y: float = 0.0
     yaw: float = 0.0
@@ -57,6 +93,19 @@ class Pose2D:
 
 @dataclass
 class Waypoint:
+    """One stop in a mission.
+
+    Attributes:
+        name: Label shown in logs.
+        gps: Target position.
+        local: Optional target in the local frame, used in SLAM_LOCALISE. If None,
+            the navigator uses (0, 0) when it gets there.
+        drilled: Set True by ``Navigator.notify_drill_complete``.
+        measured: Set True by ``Navigator.notify_measure_complete``.
+        action: What to do on arrival, for example "sample".
+        tolerance_m: How close counts as arrived in ``Navigator.run_mission``.
+    """
+
     name: str
     gps: GPSCoord
     local: Optional[Pose2D] = None
@@ -67,6 +116,12 @@ class Waypoint:
 
     @classmethod
     def from_csv_row(cls, row: dict) -> "Waypoint":
+        """Build a waypoint from one ``csv.DictReader`` row.
+
+        Accepts a few column spellings: ``lat``/``latitude``,
+        ``lon``/``lng``/``longitude``, and ``tolerance_m``/``tolerance``. Missing
+        values fall back to defaults (0.0 for coordinates, so check the CSV).
+        """
         gps = GPSCoord(
             lat=float(row.get("lat") or row.get("latitude") or 0.0),
             lon=float(row.get("lon") or row.get("lng") or row.get("longitude") or 0.0),
@@ -80,6 +135,9 @@ class Waypoint:
 
 
 class NavState(Enum):
+    """States of the ``Navigator`` state machine (see the module docstring for the order).
+    """
+
     IDLE = auto()
     GPS_NAVIGATE = auto()
     SLAM_LOCALISE = auto()
@@ -94,6 +152,11 @@ class GPSReceiver:
     """Reads NMEA sentences from a serial GPS module or uses a mock fallback."""
 
     def __init__(self, cfg=CFG.navigation):
+        """Connect to the GPS unless running in simulation.
+
+        Args:
+            cfg: Port and baud rate. Defaults to ``CFG.navigation``.
+        """
         self._cfg = cfg
         self._coord = GPSCoord(0, 0, fix=False)
         self._serial = None
@@ -101,6 +164,7 @@ class GPSReceiver:
             self._serial = self._connect()
 
     def _connect(self):
+        """Open the GPS serial port. Returns None (mock mode) if that fails."""
         try:
             serial_mod = import_module("serial")
             serial_port = serial_mod.Serial(self._cfg.gps_port, self._cfg.gps_baudrate, timeout=1.0)
@@ -111,11 +175,23 @@ class GPSReceiver:
             return None
 
     def read(self) -> GPSCoord:
+        """Return the latest fix, from the serial port or the mock."""
         if self._serial is None:
             return self._mock_read()
         return self._parse_serial()
 
     def _parse_serial(self) -> GPSCoord:
+        """Read one NMEA line and update the stored fix if it is usable.
+
+        Handles two sentence types:
+
+        * ``$GPRMC``: used when the status field (index 2) is ``A`` (active).
+        * ``$GPGGA``: used when the fix quality (index 6) is above 0; also gives HDOP.
+
+        Other sentences and parse errors leave the previous fix unchanged. Note that
+        some receivers (including many NEO-M8N setups) send ``$GNRMC``/``$GNGGA``
+        instead, which this parser does not match yet.
+        """
         serial_port = self._serial
         if serial_port is None:
             return self._mock_read()
@@ -141,6 +217,13 @@ class GPSReceiver:
 
     @staticmethod
     def _nmea_to_dd(value: str, direction: str) -> float:
+        """Convert an NMEA ``ddmm.mmmm`` (or ``dddmm.mmmm``) value to decimal degrees.
+
+        The two digits before the decimal point and everything after are minutes;
+        anything before that is whole degrees. South and west are made negative.
+
+        Example: ``"3037.686", "N"`` -> 30 + 37.686 / 60 = 30.6281.
+        """
         if not value:
             return 0.0
         dot = value.index(".")
@@ -150,6 +233,12 @@ class GPSReceiver:
         return -decimal_degrees if direction in ("S", "W") else decimal_degrees
 
     def _mock_read(self) -> GPSCoord:
+        """Return a fake fix that moves about 1.1 m north and east per call.
+
+        0.00001 degrees of latitude is about 1.1 m. A random +/-10% wobble is added.
+        The mock always heads north-east, whatever the target, so only waypoints in
+        that direction will ever be reached in simulation.
+        """
         self._coord.lat += 0.00001 * (1 + (0.1 - 0.2 * random.random()))
         self._coord.lon += 0.00001 * (1 + (0.1 - 0.2 * random.random()))
         self._coord.fix = True
@@ -158,11 +247,20 @@ class GPSReceiver:
 
 
 class SLAMInterface:
+    """Local pose source.
+
+    If ``rclpy`` imports, it is meant to read the pose from slam_toolbox, but that
+    part is not written yet, so ``get_pose`` always returns the dead-reckoned pose
+    from ``update_odometry``.
+    """
+
     def __init__(self):
+        """Start at the origin and check whether ROS 2 is installed."""
         self._pose = Pose2D()
         self._ros = self._try_ros()
 
     def _try_ros(self):
+        """Return True if the ROS 2 Python packages can be imported."""
         try:
             import_module("rclpy")
             import_module("geometry_msgs.msg")
@@ -173,20 +271,37 @@ class SLAMInterface:
             return False
 
     def get_pose(self) -> Pose2D:
+        """Return the current pose. TODO: read from ROS 2 when ``self._ros`` is True."""
         if self._ros:
             pass
         return self._pose
 
     def update_odometry(self, dx: float, dy: float, dyaw: float):
+        """Add a motion measured in the rover's own frame to the pose.
+
+        Args:
+            dx: Forward distance in metres.
+            dy: Sideways distance in metres.
+            dyaw: Change in heading in degrees.
+
+        The (dx, dy) step is rotated by the current yaw into the local frame before it
+        is added. Yaw is then wrapped to 0..360.
+        """
         yaw_rad = math.radians(self._pose.yaw)
         self._pose.x += dx * math.cos(yaw_rad) - dy * math.sin(yaw_rad)
         self._pose.y += dx * math.sin(yaw_rad) + dy * math.cos(yaw_rad)
         self._pose.yaw = (self._pose.yaw + dyaw) % 360
 
     def distance_to_local(self, target: Pose2D) -> float:
+        """Straight-line distance in metres from the current pose to ``target``."""
         return math.hypot(target.x - self._pose.x, target.y - self._pose.y)
 
     def bearing_to_local(self, target: Pose2D) -> float:
+        """Bearing in degrees from the current pose to ``target``.
+
+        Uses ``atan2(dx, dy)`` so 0 degrees points along +y (north) and 90 along +x
+        (east), matching ``GPSCoord.bearing_to``.
+        """
         return math.degrees(math.atan2(target.x - self._pose.x, target.y - self._pose.y))
 
 
@@ -199,6 +314,13 @@ class Navigator:
         gps: Optional[GPSReceiver] = None,
         slam: Optional[SLAMInterface] = None,
     ):
+        """Create a navigator.
+
+        Args:
+            waypoints: Mission stops, in order.
+            gps: GPS source. A new ``GPSReceiver`` is made if not given.
+            slam: Local pose source. A new ``SLAMInterface`` is made if not given.
+        """
         self.waypoints = waypoints or []
         self.gps = gps or GPSReceiver()
         self.slam = slam or SLAMInterface()
@@ -208,6 +330,11 @@ class Navigator:
 
     @staticmethod
     def from_csv(path: str) -> "Navigator":
+        """Load waypoints from a CSV file (see ``Waypoint.from_csv_row``).
+
+        Raises:
+            ValueError: If the file has no data rows.
+        """
         with open(path, newline="") as handle:
             rows = list(csv.DictReader(handle))
         if not rows:
@@ -216,6 +343,7 @@ class Navigator:
         return Navigator(waypoints)
 
     def status(self) -> dict:
+        """Return the state, current waypoint and number remaining as a dict."""
         current = self.current_waypoint
         return {
             "state": self.state.name,
@@ -225,18 +353,30 @@ class Navigator:
         }
 
     def set_target(self, target: str) -> None:
+        """Store a free-form target name (simple API used by ``main.py``)."""
         self.current_target = target
 
     def get_target(self) -> str | None:
+        """Return the target set by ``set_target``, or None."""
         return self.current_target
 
     @property
     def current_waypoint(self) -> Optional[Waypoint]:
+        """The waypoint being worked on, or None once all are done."""
         if self.current_wp_idx < len(self.waypoints):
             return self.waypoints[self.current_wp_idx]
         return None
 
     def step(self) -> NavState:
+        """Advance the state machine by one tick and return the new state.
+
+        GPS_NAVIGATE becomes SLAM_LOCALISE once within
+        ``CFG.navigation.waypoint_tolerance_m``. SLAM_LOCALISE becomes ALIGNING once
+        within 0.1 m of the local target. ALIGNING, DRILLING and MEASURING wait for
+        the matching ``notify_*`` call.
+
+        This method does not command the motors; it only tracks progress.
+        """
         wp = self.current_waypoint
         if wp is None:
             self.state = NavState.DONE
@@ -277,10 +417,13 @@ class Navigator:
         return self.state
 
     def notify_aligned(self):
+        """Call when the alignment system finishes. ALIGNING -> DRILLING."""
         if self.state == NavState.ALIGNING:
             self.state = NavState.DRILLING
 
     def notify_drill_complete(self):
+        """Call when the drill finishes. Marks the waypoint drilled; DRILLING -> MEASURING.
+        """
         if self.state == NavState.DRILLING:
             wp = self.current_waypoint
             if wp:
@@ -288,6 +431,10 @@ class Navigator:
             self.state = NavState.MEASURING
 
     def notify_measure_complete(self):
+        """Call when the spectrometer reading is done.
+
+        Marks the waypoint measured and moves to the next one, or to DONE.
+        """
         if self.state == NavState.MEASURING:
             wp = self.current_waypoint
             if wp:
@@ -300,6 +447,11 @@ class Navigator:
             )
 
     def run_demo(self, ticks: int = 60):
+        """Run the full state machine with fake delays for each step.
+
+        Args:
+            ticks: Maximum number of ticks before giving up.
+        """
         log.info("=== Navigator demo: %d waypoints, %d ticks ===", len(self.waypoints), ticks)
         self.state = NavState.IDLE
         tick_delay = 0.2
@@ -329,7 +481,19 @@ class Navigator:
             time.sleep(tick_delay)
 
     def run_mission(self, ticks: int = 120, tick_delay: float = 0.2) -> list[dict]:
-        """Drive through the configured waypoint list and return a summary of progress."""
+        """Drive through the configured waypoint list and return a summary of progress.
+
+        This is a simpler loop than ``step``: it only checks GPS distance against each
+        waypoint's ``tolerance_m`` and skips alignment, drilling and measuring.
+
+        Args:
+            ticks: Maximum number of ticks.
+            tick_delay: Seconds to sleep between ticks.
+
+        Returns:
+            One dict per reached waypoint with ``waypoint``, ``status``,
+            ``distance_m`` and ``action``.
+        """
         if not self.waypoints:
             log.warning("No waypoints configured for mission")
             return []

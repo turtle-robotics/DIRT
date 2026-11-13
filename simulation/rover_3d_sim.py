@@ -1,12 +1,20 @@
-"""
-DIRT Bot - 3D Rover Simulation
-===============================
+"""DIRT 3D rover simulation (legacy OpenCV renderer).
 
 Renders a rover moving through a 3D terrain with a simple chase camera,
-waypoint following, and a field log that can be saved to CSV.
-        cv2.putText(panel, "speed / pitch / roll", (14, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (210, 210, 210), 1, cv2.LINE_AA)
+waypoint following, and a field log that can be saved to CSV. Everything is
+drawn with OpenCV lines and polygons, so it needs no 3D engine.
+
 This complements the alignment simulator by showing the rover traveling
 through an environment instead of only correcting a camera pose.
+
+Superseded: ``dirt_sim_core.py`` (physics) and ``rover_3d_panda.py``
+(viewer) replace this file. Its motion model is purely kinematic (no motors,
+treads or forces) and its power, slip and curvature numbers are rough
+estimates. It stays as the fallback ``main.py --test rover3d`` uses when
+Panda3D will not import, and for ``bench_rover_fps.py``.
+
+Controls: q quit, m manual, space pause, r reset, W/S throttle, A/D steer,
+x zero input, 1 back to autonomous.
 """
 
 from __future__ import annotations
@@ -39,18 +47,23 @@ TERRAIN_PROFILES = {"rolling", "dunes", "rocky"}
 
 
 def _clamp(value: float, low: float, high: float) -> float:
+    """Limit ``value`` to the range [low, high]."""
     return max(low, min(high, value))
 
 
 def _wrap_angle_deg(angle: float) -> float:
+    """Wrap an angle in degrees to [-180, 180)."""
     return (angle + 180.0) % 360.0 - 180.0
 
 
 def _lerp(value: float, target: float, alpha: float) -> float:
+    """Move ``value`` a fraction ``alpha`` (clamped to 0..1) of the way toward ``target``.
+    """
     return value + (target - value) * _clamp(alpha, 0.0, 1.0)
 
 
 def _rotation_matrix(yaw_deg: float) -> np.ndarray:
+    """3x3 rotation about +Z by ``yaw_deg`` (counter-clockwise)."""
     yaw = math.radians(yaw_deg)
     c = math.cos(yaw)
     s = math.sin(yaw)
@@ -59,6 +72,8 @@ def _rotation_matrix(yaw_deg: float) -> np.ndarray:
 
 @dataclass
 class Waypoint3D:
+    """A target point on the ground in metres."""
+
     name: str
     x: float
     y: float
@@ -66,6 +81,8 @@ class Waypoint3D:
 
 @dataclass
 class RoverState:
+    """Rover pose and speed. Heading 0 = +X, counter-clockwise positive, in degrees."""
+
     x: float
     y: float
     heading_deg: float
@@ -77,6 +94,8 @@ class RoverState:
 
 @dataclass
 class RoverSample:
+    """One CSV row. ``dirt_sim_core.RoverSample`` keeps these same first columns."""
+
     step: int
     run_label: str
     control_mode: str
@@ -100,6 +119,8 @@ class RoverSample:
 
 @dataclass
 class MotionLog:
+    """Recorded ``RoverSample`` rows for one run."""
+
     rows: List[RoverSample] = field(default_factory=list)
 
     def record(
@@ -118,6 +139,7 @@ class MotionLog:
         path_curvature: float,
         reached: bool,
     ) -> None:
+        """Round the values and append one row."""
         self.rows.append(
             RoverSample(
                 step=step,
@@ -143,6 +165,7 @@ class MotionLog:
         )
 
     def save_csv(self, path: str = "sim_rover_3d_path.csv") -> None:
+        """Write every row to ``path``. Does nothing if empty."""
         if not self.rows:
             return
         with open(path, "w", newline="") as file_handle:
@@ -154,11 +177,21 @@ class MotionLog:
 
 
 class TerrainField:
+    """Analytic height field for rolling, dunes or rocky terrain (scalar inputs only).
+    """
+
     def __init__(self, span_m: float = 24.0, terrain_mode: str = "rolling"):
+        """Pick the terrain.
+
+        Args:
+            span_m: World width and length in metres, centred on 0.
+            terrain_mode: ``"rolling"``, ``"dunes"`` or ``"rocky"``. Others use rolling.
+        """
         self.span_m = span_m
         self.terrain_mode = terrain_mode if terrain_mode in TERRAIN_PROFILES else "rolling"
 
     def height(self, x: float, y: float) -> float:
+        """Ground height in metres at (x, y): a sum of sines and cosines."""
         if self.terrain_mode == "dunes":
             return 0.55 * math.sin(x / 2.4) + 0.25 * math.sin((x + y) / 3.6) + 0.14 * math.cos(y / 4.4)
         if self.terrain_mode == "rocky":
@@ -176,12 +209,20 @@ class TerrainField:
         )
 
     def gradient(self, x: float, y: float, delta: float = 0.15) -> Tuple[float, float]:
+        """Slope (dz/dx, dz/dy) by central differences with half-spacing ``delta``."""
         dx = (self.height(x + delta, y) - self.height(x - delta, y)) / (2.0 * delta)
         dy = (self.height(x, y + delta) - self.height(x, y - delta)) / (2.0 * delta)
         return dx, dy
 
 
 class Rover3DSim:
+    """Kinematic rover model plus its OpenCV renderer.
+
+    ``step(dt)`` moves the rover; ``render(resolution)`` returns a BGR image of
+    the scene with a minimap and a speed/pitch/roll history panel. Expensive
+    pieces (background, terrain mesh, panel backgrounds) are cached per size.
+    """
+
     def __init__(
         self,
         waypoints: Optional[Sequence[Waypoint3D]] = None,
@@ -193,6 +234,16 @@ class Rover3DSim:
         control_mode: str = "pursuit",
         terrain_mode: str = "rolling",
     ):
+        """Set up the terrain, route and camera.
+
+        Args:
+            waypoints: Route. Defaults to Start plus three sample sites.
+            terrain_span_m: World size in metres.
+            waypoint_tolerance_m: How close counts as arrived.
+            max_speed_mps, steering_gain, accel_mps2: Override the control profile.
+            control_mode: ``"smooth"``, ``"pursuit"`` or ``"aggressive"``.
+            terrain_mode: ``"rolling"``, ``"dunes"`` or ``"rocky"``.
+        """
         if control_mode not in CONTROL_PROFILES:
             control_mode = "pursuit"
         if terrain_mode not in TERRAIN_PROFILES:
@@ -238,6 +289,7 @@ class Rover3DSim:
         self._camera_target = np.array([self.state.x + 2.0, self.state.y + 1.0, self.state.z + 0.2], dtype=float)
 
     def _default_waypoints(self) -> List[Waypoint3D]:
+        """Start plus three sample sites (same as the core sim's farmland route)."""
         return [
             Waypoint3D("Start", -8.0, -7.0),
             Waypoint3D("Sample A", -1.5, -2.5),
@@ -246,23 +298,28 @@ class Rover3DSim:
         ]
 
     def current_waypoint(self) -> Optional[Waypoint3D]:
+        """The waypoint being driven to, or None when the route is done."""
         if self.target_idx >= len(self.waypoints):
             return None
         return self.waypoints[self.target_idx]
 
     def _advance_target(self) -> None:
+        """Move on to the next waypoint."""
         self.target_idx += 1
 
     def _limit_to_world(self) -> None:
+        """Keep the rover inside the square world."""
         self.state.x = _clamp(self.state.x, -self._bounds, self._bounds)
         self.state.y = _clamp(self.state.y, -self._bounds, self._bounds)
 
     def _update_body_orientation(self) -> None:
+        """Set pitch and roll from the ground slope under the rover's centre."""
         slope_x, slope_y = self.terrain.gradient(self.state.x, self.state.y)
         self.state.pitch_deg = math.degrees(math.atan(-slope_x))
         self.state.roll_deg = math.degrees(math.atan(slope_y))
 
     def _estimate_path_curvature(self, target: Optional[Waypoint3D], heading_error: float, distance: float) -> float:
+        """Rough curvature estimate: heading error divided by distance to target."""
         if target is None:
             return 0.0
         if distance < 1e-6:
@@ -270,6 +327,8 @@ class Rover3DSim:
         return abs(heading_error) / max(distance, 0.1)
 
     def _estimate_power_draw(self, heading_error: float, slope_mag: float, speed: float) -> float:
+        """Rough power estimate in W: 14 W base plus speed, steering and slope terms (not a motor model).
+        """
         base = 14.0
         motion_cost = 7.5 * speed
         steering_cost = 0.06 * abs(heading_error)
@@ -277,16 +336,21 @@ class Rover3DSim:
         return base + motion_cost + steering_cost + slope_cost
 
     def _estimate_wheel_slip(self, slope_mag: float, heading_error: float) -> float:
+        """Rough slip fraction from slope and heading error, capped at 0.45."""
         slip = 0.03 + 0.12 * slope_mag + 0.0025 * abs(heading_error)
         return _clamp(slip, 0.0, 0.45)
 
     def toggle_manual_mode(self) -> None:
+        """Switch between keyboard and autonomous driving."""
         self.manual_mode = not self.manual_mode
 
     def toggle_pause(self) -> None:
+        """Pause or resume motion."""
         self.paused = not self.paused
 
     def reset_pose(self) -> None:
+        """Return to the start, restart the route, and clear the trail, history and dust.
+        """
         self.state = RoverState(x=-8.0, y=-7.0, heading_deg=25.0, speed=0.0, z=self.terrain.height(-8.0, -7.0))
         self.target_idx = 0
         self.trail.clear()
@@ -299,6 +363,13 @@ class Rover3DSim:
         self.manual_steer = 0.0
 
     def handle_key(self, key: int) -> bool:
+        """Handle one ``cv2.waitKey`` code.
+
+        W/S/A/D nudge throttle or steer by 0.15 per press and switch to manual mode.
+
+        Returns:
+            True if the user asked to quit.
+        """
         if key in (-1, 255):
             return False
 
@@ -331,6 +402,8 @@ class Rover3DSim:
         return False
 
     def _spawn_dust(self) -> None:
+        """Add dust particles behind the rover when it is moving (keeps the newest 220).
+        """
         if abs(self.state.speed) < 0.08:
             return
         heading_rad = math.radians(self.state.heading_deg)
@@ -343,6 +416,7 @@ class Rover3DSim:
             self._dust_particles = self._dust_particles[-220:]
 
     def _step_manual(self, dt: float) -> None:
+        """Move from the manual throttle and steer (up to 85 deg/s of turn)."""
         steer_rate = 85.0 * self.manual_steer
         self.state.heading_deg = _wrap_angle_deg(self.state.heading_deg + steer_rate * dt)
 
@@ -367,6 +441,14 @@ class Rover3DSim:
         self._spawn_dust()
 
     def _step_autonomous(self, dt: float) -> bool:
+        """Steer toward the current waypoint and move.
+
+        Turn rate is ``heading_error * steering_gain`` deg/s (capped at 90), and
+        speed eases down within 2.5 m of the target.
+
+        Returns:
+            True when there are no waypoints left.
+        """
         target = self.current_waypoint()
         if target is None:
             self.state.speed = 0.0
@@ -410,6 +492,11 @@ class Rover3DSim:
         return self.current_waypoint() is None
 
     def step(self, dt: float = 0.12) -> bool:
+        """Advance the sim by ``dt`` seconds.
+
+        Returns:
+            True when the route is done (never in manual mode or while paused).
+        """
         if self.paused:
             self._update_body_orientation()
             return False
@@ -425,6 +512,11 @@ class Rover3DSim:
         camera_target: np.ndarray,
         camera_up: np.ndarray,
     ) -> Optional[Tuple[float, float, float]]:
+        """Convert a world point to camera coordinates (right, up, forward).
+
+        Builds the camera's axes from the eye, target and up vectors. Returns None
+        for points behind or too close to the camera (forward <= 0.15 m).
+        """
         forward = camera_target - camera_pos
         forward_norm = np.linalg.norm(forward)
         if forward_norm < 1e-6:
@@ -455,6 +547,14 @@ class Rover3DSim:
         h: int,
         focal: float,
     ) -> Optional[Tuple[int, int, float]]:
+        """Project a world point to pixel coordinates with a pinhole camera.
+
+        ``x = w/2 + f * x_cam / z_cam`` and ``y = 0.66 h - f * y_cam / z_cam``; the
+        horizon sits at 66% of the image height rather than the centre.
+
+        Returns:
+            (x_px, y_px, depth), or None if the point is not in front of the camera.
+        """
         cam = self._world_to_camera(np.array(point, dtype=float), camera_pos, camera_target, camera_up)
         if cam is None:
             return None
@@ -475,6 +575,7 @@ class Rover3DSim:
         camera_up: np.ndarray,
         focal: float,
     ) -> None:
+        """Draw a 3D line segment if both ends are in front of the camera."""
         h, w = canvas.shape[:2]
         a = self._project(p1, camera_pos, camera_target, camera_up, w, h, focal)
         b = self._project(p2, camera_pos, camera_target, camera_up, w, h, focal)
@@ -492,6 +593,7 @@ class Rover3DSim:
         camera_up: np.ndarray,
         focal: float,
     ) -> None:
+        """Fill a convex 3D polygon if every corner is in front of the camera."""
         h, w = canvas.shape[:2]
         projected: List[Tuple[int, int]] = []
         for point in points:
@@ -512,6 +614,8 @@ class Rover3DSim:
         width: int,
         height: int,
     ) -> Optional[int]:
+        """On-screen size in pixels (2..22) of a world-space offset at ``point``; used to size circles with depth.
+        """
         base = self._project(point, camera_pos, camera_target, camera_up, width, height, focal)
         other = self._project((point[0] + offset[0], point[1] + offset[1], point[2] + offset[2]), camera_pos, camera_target, camera_up, width, height, focal)
         if base is None or other is None:
@@ -525,15 +629,21 @@ class Rover3DSim:
         local_point: Tuple[float, float, float],
         base_z: float,
     ) -> Tuple[float, float, float]:
+        """Rotate a rover-frame (x, y) offset by ``rot`` and add the rover position; z is ``base_z + local z``.
+        """
         rotated = rot @ np.array([local_point[0], local_point[1], 0.0], dtype=float)
         return (self.state.x + rotated[0], self.state.y + rotated[1], base_z + local_point[2])
 
     def _render_minimap(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
+        """Draw the top-down minimap: trail, waypoints (current one highlighted) and a heading arrow.
+        """
         w, h = size
         pad = 18
         panel = self._get_minimap_base(size)
 
         def to_px(x: float, y: float) -> Tuple[int, int]:
+            """Map world (x, y) in metres to minimap pixels (y flipped so north is up).
+            """
             px = int(pad + ((x + self._bounds) / (2 * self._bounds)) * (w - 2 * pad))
             py = int(h - pad - ((y + self._bounds) / (2 * self._bounds)) * (h - 2 * pad))
             return px, py
@@ -560,6 +670,7 @@ class Rover3DSim:
         return panel
 
     def _render_history_panel(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
+        """Draw recent speed, pitch and roll as line charts."""
         w, h = size
         panel = self._get_history_base(size)
 
@@ -569,6 +680,8 @@ class Rover3DSim:
         roll_series = self.history_roll[-history:]
 
         def normalize(series: List[float], minimum: float, maximum: float) -> List[Tuple[int, int]]:
+            """Scale a series into panel pixel coordinates between ``minimum`` and ``maximum``.
+            """
             if len(series) < 2:
                 return []
             points: List[Tuple[int, int]] = []
@@ -592,6 +705,8 @@ class Rover3DSim:
         return panel
 
     def _world_point(self, dx: float, dy: float, dz: float = 0.0) -> Tuple[float, float, float]:
+        """World point at a rover-frame offset (dx forward, dy left), sitting ``dz`` above the ground.
+        """
         heading = math.radians(self.state.heading_deg)
         c = math.cos(heading)
         s = math.sin(heading)
@@ -601,6 +716,7 @@ class Rover3DSim:
         return x, y, z
 
     def _build_background(self, resolution: Tuple[int, int]) -> np.ndarray:
+        """Draw the sky gradient and ground glow for a given image size."""
         width, height = resolution
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
 
@@ -626,12 +742,16 @@ class Rover3DSim:
         return canvas
 
     def _get_background(self, resolution: Tuple[int, int]) -> np.ndarray:
+        """Return a copy of the cached background for this size, building it the first time.
+        """
         key = (int(resolution[0]), int(resolution[1]))
         if key not in self._background_cache:
             self._background_cache[key] = self._build_background(key)
         return self._background_cache[key].copy()
 
     def _get_terrain_segments(self) -> List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[int, int, int]]]:
+        """Build (and cache) the terrain wireframe as coloured 3D line segments on a 13-line grid.
+        """
         key = (self.terrain_mode, self._bounds)
         if key in self._terrain_cache:
             return self._terrain_cache[key]
@@ -664,6 +784,7 @@ class Rover3DSim:
         return segments
 
     def _get_terrain_faces(self) -> List[Tuple[Tuple[Tuple[float, float, float], ...], Tuple[int, int, int]]]:
+        """Build (and cache) the filled terrain quads, shaded by height and slope."""
         key = (self.terrain_mode, self._bounds)
         if key in self._terrain_fill_cache:
             return self._terrain_fill_cache[key]
@@ -700,6 +821,8 @@ class Rover3DSim:
         return faces
 
     def _get_minimap_base(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
+        """Return a copy of the cached minimap background (grid and terrain shading) for this size.
+        """
         key = (int(size[0]), int(size[1]))
         if key in self._minimap_base_cache:
             return self._minimap_base_cache[key].copy()
@@ -718,6 +841,7 @@ class Rover3DSim:
         span = max(hmax - hmin, 1e-6)
 
         def to_px(x: float, y: float) -> Tuple[int, int]:
+            """Map world (x, y) in metres to minimap pixels."""
             px = int(pad + (x + self._bounds) / (2 * self._bounds) * (w - 2 * pad))
             py = int(h - pad - (y + self._bounds) / (2 * self._bounds) * (h - 2 * pad))
             return px, py
@@ -747,6 +871,7 @@ class Rover3DSim:
         return panel.copy()
 
     def _get_history_base(self, size: Tuple[int, int] = (290, 290)) -> np.ndarray:
+        """Return a copy of the cached history panel background for this size."""
         key = (int(size[0]), int(size[1]))
         if key in self._history_base_cache:
             return self._history_base_cache[key].copy()
@@ -764,6 +889,7 @@ class Rover3DSim:
         return panel.copy()
 
     def _render_dust(self, canvas: np.ndarray, camera_pos: np.ndarray, camera_target: np.ndarray, camera_up: np.ndarray, focal: float, width: int, height: int) -> None:
+        """Draw the dust particles, fading by their alpha."""
         for x, y, z, radius, alpha in self._dust_particles:
             dust_point = (x, y, z)
             p = self._project(dust_point, camera_pos, camera_target, camera_up, width, height, focal)
@@ -774,6 +900,12 @@ class Rover3DSim:
             cv2.circle(canvas, (px, py), max(2, int(radius * 8)), (intensity, intensity, intensity), -1, cv2.LINE_AA)
 
     def render(self, resolution: Tuple[int, int] = (2560, 1440)) -> np.ndarray:
+        """Draw one full frame and return it as a BGR image.
+
+        Large requests are rendered at about 0.9 megapixels to keep the frame rate
+        up; the caller scales the result to the window. The chase camera eases toward
+        a point behind and above the rover, pulling back a little as speed rises.
+        """
         width, height = resolution
         target_pixels = 900_000
         render_scale = 1.0
@@ -1209,6 +1341,7 @@ class Rover3DSim:
         return canvas
 
     def save_path_csv(self, path: str = "sim_rover_3d_path.csv") -> None:
+        """Write the path log to ``path``."""
         self.log.save_csv(path)
 
 
@@ -1227,6 +1360,18 @@ def run_rover_3d_demo(
     run_label: str = "demo",
     start_manual: bool = False,
 ) -> MotionLog:
+    """Run the OpenCV sim, optionally in a window, and return the log.
+
+    Logs one row per step and stops at ``max_steps``, when the route is done, or
+    when q is pressed. ``target_fps`` is clamped to 60..120. Takes the same main
+    arguments as the Panda3D version so ``main.py`` can call either.
+
+    Args:
+        show_video: Open a window. False runs as fast as possible.
+        save_csv: Write ``csv_path`` at the end.
+        delay_ms: Base for the ``cv2.waitKey`` wait per frame.
+        start_manual: Start in keyboard driving mode.
+    """
     sim = Rover3DSim(
         waypoints=waypoints,
         waypoint_tolerance_m=waypoint_tolerance_m,
@@ -1328,6 +1473,7 @@ def run_rover_3d_demo(
 
 
 def _build_waypoints_from_csv(path: str) -> List[Waypoint3D]:
+    """Load waypoints from a CSV with ``name,x,y`` columns."""
     waypoints: List[Waypoint3D] = []
     with open(path, newline="") as file_handle:
         for row in csv.DictReader(file_handle):

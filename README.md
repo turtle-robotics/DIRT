@@ -356,6 +356,10 @@ modules, check them against the hardware table above.
 - Start every new file with a docstring that says what it does, and comment
   any non-obvious math (drive model, track mixer, EKF settings, spectral
   preprocessing).
+- Give every class and function a docstring in Google style: a one-line
+  summary, then `Args:`, `Returns:` and `Raises:` sections where they help.
+  State units (m, s, rad or deg, cm) for every physical value. Use `Note:` or
+  `TODO:` for known gaps so they are easy to search for.
 - Write simulation output to a folder like `sim_runs/`, not over the checked-in
   reference data.
 - Never commit virtual environments, bytecode, API keys, or hardware

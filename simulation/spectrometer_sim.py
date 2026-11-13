@@ -59,6 +59,7 @@ SOIL_TYPES = tuple(sorted(SOIL_BASES.keys()))
 
 
 def _clamp(value: float, low: float, high: float) -> float:
+    """Limit ``value`` to the range [low, high]."""
     return max(low, min(high, value))
 
 
@@ -67,16 +68,23 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 @dataclass
 class SpectralReading:
+    """One spectrum: wavelength (nm) -> counts, plus time and sensor temperature. Same as in ``spectrometer.py``.
+    """
+
     channels: Dict[int, float]
     timestamp: float = field(default_factory=time.time)
     temperature_c: float = 25.0
 
     def to_array(self) -> np.ndarray:
+        """Return the channel values as a 1-D array, sorted by wavelength."""
         return np.array([self.channels[wl] for wl in sorted(self.channels)])
 
 
 @dataclass
 class SoilAnalysisResult:
+    """Predicted moisture %, organic matter %, iron oxide index and 0..1 confidence for one reading.
+    """
+
     moisture_pct: float
     organic_matter_pct: float
     iron_oxide_idx: float
@@ -86,6 +94,8 @@ class SoilAnalysisResult:
 
 @dataclass
 class SpectrometerSample:
+    """One CSV row: step number, run label, soil type and the rounded predictions."""
+
     step: int
     run_label: str
     soil_type: str
@@ -98,6 +108,8 @@ class SpectrometerSample:
 
 @dataclass
 class SpectrometerLog:
+    """All samples from one run. Written to CSV when the sim closes."""
+
     rows: List[SpectrometerSample] = field(default_factory=list)
 
     def record(
@@ -107,6 +119,7 @@ class SpectrometerLog:
         soil_type: str,
         soil_result: SoilAnalysisResult,
     ) -> None:
+        """Round a result and add it as a new row."""
         self.rows.append(
             SpectrometerSample(
                 step=step,
@@ -121,6 +134,8 @@ class SpectrometerLog:
         )
 
     def save_csv(self, path: str = "sim_spectrometer_log.csv") -> None:
+        """Write every row to ``path`` (overwrites it). Does nothing if there are no rows.
+        """
         if not self.rows:
             return
         with open(path, "w", newline="") as file_handle:
@@ -135,27 +150,43 @@ class SpectrometerLog:
 
 
 class MockAS7265xDriver:
+    """Fake 18-channel sensor: a fixed soil spectrum plus about 1% noise. Same as in ``spectrometer.py``.
+    """
+
     def __init__(self, soil_type: str = "loam", scale: float = 10_000.0,
                  rng: Optional[np.random.Generator] = None):
+        """Pick the base spectrum.
+
+        Args:
+            soil_type: Key in ``SOIL_BASES``; unknown names use loam.
+            scale: Multiplier from 0..1 reflectance to counts.
+            rng: Random generator, so runs can be made repeatable.
+        """
         self._base = SOIL_BASES.get(soil_type, SOIL_BASES["loam"])
         self._scale = scale
         self._rng = rng or np.random.default_rng()
 
     def read_calibrated(self) -> Dict[int, float]:
+        """Return wavelength -> counts with fresh noise."""
         noise = self._rng.normal(0, 0.01, len(WAVELENGTHS_NM))
         counts = np.clip((self._base + noise) * self._scale, 0, None)
         return {wl: float(c) for wl, c in zip(WAVELENGTHS_NM, counts)}
 
     def read_temperature(self) -> float:
+        """Return about 25 degrees C with a little noise."""
         return 25.0 + float(self._rng.normal(0, 0.5))
 
 
 def snv(spectrum: np.ndarray) -> np.ndarray:
+    """Standard Normal Variate: subtract the mean, divide by the std. Removes brightness/scale differences.
+    """
     mu, std = spectrum.mean(), spectrum.std()
     return (spectrum - mu) / (std + 1e-9)
 
 
 def savitzky_golay(spectrum: np.ndarray, window: int = 5, poly: int = 2) -> np.ndarray:
+    """Polynomial smoothing (see ``spectrometer.savitzky_golay`` for details). End points are left as is.
+    """
     half = window // 2
     out = spectrum.copy()
     for i in range(half, len(spectrum) - half):
@@ -167,11 +198,20 @@ def savitzky_golay(spectrum: np.ndarray, window: int = 5, poly: int = 2) -> np.n
 
 
 def preprocess(spectrum: np.ndarray) -> np.ndarray:
+    """Savitzky-Golay smoothing, then SNV. Same pipeline as the real module."""
     return snv(savitzky_golay(spectrum))
 
 
 class SoilPLSModel:
+    """PLS regression from spectrum to soil properties, with a least-squares fallback.
+
+    A compact copy of ``spectrometer.SoilPLSModel``. Keep the two in sync if
+    either changes.
+    """
+
     def __init__(self, n_components: int = 6):
+        """Create the sklearn PLS model, or prepare the numpy fallback if sklearn is missing.
+        """
         try:
             from sklearn.cross_decomposition import PLSRegression
             from sklearn.preprocessing import StandardScaler
@@ -188,6 +228,12 @@ class SoilPLSModel:
         self._cov_inv = None
 
     def fit(self, X_raw: np.ndarray, y: np.ndarray):
+        """Preprocess, standardise and fit, then cache the inverse covariance for confidence.
+
+        Args:
+            X_raw: (n_samples, 18) raw spectra.
+            y: (n_samples, 3) targets: moisture %, organic matter %, iron oxide index.
+        """
         X_pre = np.apply_along_axis(preprocess, 1, X_raw)
         if self._pls is not None:
             X_sc = self._scaler.fit_transform(X_pre)
@@ -206,6 +252,13 @@ class SoilPLSModel:
         log.info("Soil PLS model fitted (%s backend)", "sklearn" if self._pls is not None else "numpy fallback")
 
     def predict(self, spectrum: np.ndarray) -> Tuple[np.ndarray, float]:
+        """Predict for one raw spectrum.
+
+        Returns:
+            (predictions, confidence). Confidence is ``exp(-0.05 * T^2)`` where T^2 is
+            the squared Mahalanobis distance from the training mean, so near 1 means
+            "looks like the training data".
+        """
         if not self._trained:
             raise RuntimeError("Model not trained")
         x_pre = preprocess(spectrum)
@@ -225,6 +278,11 @@ class SoilPLSModel:
 
     @staticmethod
     def make_synthetic_calibration(n: int = 80) -> Tuple[np.ndarray, np.ndarray]:
+        """Make seeded fake training data (repeatable).
+
+        The targets are random and unrelated to the spectra, so predictions only show
+        that the pipeline runs, not real soil values.
+        """
         rng = np.random.RandomState(0)
         soils = list(SOIL_TYPES)
         X, y = [], []
@@ -256,6 +314,15 @@ class SpectrometerSimApp:
         max_steps: Optional[int] = None,
         snapshot_path: Optional[str] = None,
     ):
+        """Train the model on synthetic data and build the bar chart window.
+
+        Args:
+            soil_type: Starting soil, one of ``SOIL_TYPES``. Unknown names use loam.
+            interval_s: Seconds between simulated captures.
+            run_label: Label written into every CSV row.
+            max_steps: Stop after this many captures. None runs until closed.
+            snapshot_path: If set, save a PNG of the first frame here.
+        """
         if soil_type not in SOIL_BASES:
             soil_type = "loam"
 
@@ -296,9 +363,16 @@ class SpectrometerSimApp:
     # -- controls (mirrors Rover3DPandaApp._bind_controls) --
 
     def _bind_controls(self) -> None:
+        """Connect matplotlib key presses to ``_on_key``."""
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
     def _on_key(self, event) -> None:
+        """Handle a key press: q quit, space pause, r reset, s snapshot, 1/2/3 soil.
+
+        Note: the number keys index into ``SOIL_TYPES``, which is sorted
+        alphabetically (clay, loam, sand). The on-screen help says
+        "loam/sand/clay", so 1 actually picks clay.
+        """
         if event.key == "q":
             self._request_quit()
         elif event.key == " ":
@@ -311,24 +385,38 @@ class SpectrometerSimApp:
             self.set_soil_type(SOIL_TYPES[int(event.key) - 1])
 
     def _request_quit(self) -> None:
+        """Mark the run finished and close the window."""
         self.finished = True
         plt.close(self.fig)
 
     def toggle_pause(self) -> None:
+        """Pause or resume captures."""
         self.paused = not self.paused
 
     def reset_pose(self) -> None:
+        """Clear the log, restart the step count and make a fresh driver. Named to match the rover sim.
+        """
         self.step_idx = 0
         self.log = SpectrometerLog()
         self.driver = MockAS7265xDriver(soil_type=self.soil_type)
         log.info("Sim reset (soil=%s)", self.soil_type)
 
     def set_soil_type(self, soil_type: str) -> None:
+        """Switch the simulated soil by making a new driver for it."""
         self.soil_type = soil_type
         self.driver = MockAS7265xDriver(soil_type=soil_type)
         log.info("Soil type changed -> %s", soil_type)
 
     def capture_snapshot(self, path: Optional[str] = None) -> bool:
+        """Save the current figure as a PNG.
+
+        Args:
+            path: Where to save. Falls back to ``snapshot_path``, then
+                ``spectrometer_snapshot.png``.
+
+        Returns:
+            True if the file was saved.
+        """
         output_path = path or self.snapshot_path or "spectrometer_snapshot.png"
         try:
             self.fig.savefig(output_path, dpi=150)
@@ -342,6 +430,8 @@ class SpectrometerSimApp:
     # -- step loop (mirrors Rover3DPandaApp._update_task) --
 
     def _step(self) -> SoilAnalysisResult:
+        """Take one mock reading and run it through the model. Predictions are clamped to valid ranges.
+        """
         reading = SpectralReading(
             channels=self.driver.read_calibrated(),
             temperature_c=self.driver.read_temperature(),
@@ -360,6 +450,8 @@ class SpectrometerSimApp:
         )
 
     def _update(self, _frame):
+        """Animation callback: take a step, update the bars and title, log it, and stop at ``max_steps``.
+        """
         if self.finished:
             return list(self.bars) + [self.title]
 
@@ -390,6 +482,7 @@ class SpectrometerSimApp:
         return list(self.bars) + [self.title]
 
     def run(self) -> None:
+        """Start the animation and block until the window closes."""
         self.ani = FuncAnimation(
             self.fig, self._update, interval=self.interval_s * 1000,
             blit=False, cache_frame_data=False,
@@ -398,6 +491,7 @@ class SpectrometerSimApp:
         plt.show()
 
     def save_readings_csv(self, path: str = "sim_spectrometer_log.csv") -> None:
+        """Write the log to ``path``."""
         self.log.save_csv(path)
 
 
@@ -410,6 +504,12 @@ def run_spectrometer_sim_demo(
     save_csv: bool = True,
     snapshot_path: Optional[str] = None,
 ) -> SpectrometerLog:
+    """Run the live spectrometer sim and return its log.
+
+    The CSV is saved even if the window is closed early or an error occurs.
+    Arguments match ``SpectrometerSimApp``; ``csv_path`` and ``save_csv``
+    control the output file.
+    """
     app = SpectrometerSimApp(
         soil_type=soil_type,
         interval_s=interval_s,

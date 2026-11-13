@@ -1,3 +1,6 @@
+"""Unit tests for the pure helper functions in ``simulation/rover_3d_panda.py`` (needs Panda3D).
+"""
+
 from simulation.rover_3d_panda import (
     clamp_target_fps,
     lighting_profile,
@@ -8,18 +11,22 @@ from simulation.rover_3d_panda import (
 
 
 def test_normalize_resolution_handles_tuple_and_string():
+    """Resolution accepts a tuple, a ``WxH`` string, or None (default 2560x1440)."""
     assert normalize_resolution((2560, 1440)) == (2560, 1440)
     assert normalize_resolution("1920x1080") == (1920, 1080)
     assert normalize_resolution(None) == (2560, 1440)
 
 
 def test_clamp_target_fps_keeps_bounds():
+    """Target FPS is clamped to the 60..120 range."""
     assert clamp_target_fps(90.0) == 90.0
     assert clamp_target_fps(20.0) == 60.0
     assert clamp_target_fps(180.0) == 120.0
 
 
 def test_terrain_palette_and_lighting_profile_are_richer():
+    """Higher terrain is brighter, and the farmland lighting and weather profiles have sensible relative values.
+    """
     low = terrain_palette("farmland", -0.20)
     high = terrain_palette("farmland", 0.70)
     assert high[1] > low[1]

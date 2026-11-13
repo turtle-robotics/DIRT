@@ -55,7 +55,21 @@ SPECTRUM_WL_START, SPECTRUM_WL_END = 400, 1000
 
 
 class DirtDisplayNode(Node):
+    """ROS 2 node behind the touchscreen display (see the module docstring for its three jobs).
+
+    Parameters (set with ``--ros-args -p name:=value``):
+
+    * ``sample_dir`` (str): where sample CSVs go. Default ``~/dirt_samples``.
+    * ``gate_enabled`` (bool): turn on the e-stop velocity gate. Default False.
+    * ``gate_in`` (str): velocity topic the gate listens to. Default ``/cmd_vel_nav``.
+    * ``gate_out`` (str): velocity topic the gate publishes. Default ``/cmd_vel``.
+    * ``web_port`` (int): port the display is served on, reported in the stats
+      so the screen can build the phone link. Default 8080.
+    """
+
     def __init__(self):
+        """Declare parameters, create the sample folder, and set up every subscription, publisher and timer.
+        """
         super().__init__('dirt_display_node')
         self.declare_parameter('sample_dir', str(Path.home() / 'dirt_samples'))
         self.declare_parameter('gate_enabled', False)
@@ -104,19 +118,33 @@ class DirtDisplayNode(Node):
 
     # ---------- sample logger ----------
     def _set(self, key, value):
+        """Store the latest value of one soil reading under ``key`` for the next sample row.
+        """
         self.latest[key] = float(value)
 
     def _on_spectrum(self, msg):
+        """Keep the most recent spectrum."""
         self.spectrum = list(msg.data)
 
     def _on_pls(self, msg):
+        """Keep the most recent PLS predictions (order given by ``PLS_LABELS``)."""
         self.pls = list(msg.data)
 
     def _on_odom(self, msg):
+        """Keep the latest x/y position from odometry for tagging samples."""
         self.latest['x_m'] = msg.pose.pose.position.x
         self.latest['y_m'] = msg.pose.pose.position.y
 
     def _on_sample_request(self, _msg):
+        """Save one sample when the Take sample button is tapped.
+
+        Appends a row to ``samples_YYYYMMDD.csv`` (time, position, soil readings,
+        PLS outputs, number of spectrum bands) and, if a spectrum has arrived, a row
+        to ``spectra_YYYYMMDD.csv`` with one column per band. Band wavelengths are
+        assumed to be evenly spaced from ``SPECTRUM_WL_START`` to ``SPECTRUM_WL_END``.
+        Readings that have not arrived yet are left blank. Then publishes a JSON
+        confirmation on ``/dirt/samples/saved``.
+        """
         now = datetime.datetime.now()
         day = now.strftime('%Y%m%d')
         samples_file = self.sample_dir / ('samples_%s.csv' % day)
@@ -152,6 +180,10 @@ class DirtDisplayNode(Node):
     # ---------- Pi stats ----------
     @staticmethod
     def _read_cpu():
+        """Return (idle, total) CPU jiffies from the first line of ``/proc/stat``.
+
+        Idle includes iowait. CPU % is worked out from the change between two calls.
+        """
         with open('/proc/stat') as f:
             parts = [int(x) for x in f.readline().split()[1:]]
         idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
@@ -159,6 +191,8 @@ class DirtDisplayNode(Node):
 
     @staticmethod
     def _read_ips():
+        """Return the Pi's IPv4 addresses from ``hostname -I``, minus loopback and Docker.
+        """
         try:
             out = subprocess.run(['hostname', '-I'], capture_output=True, text=True, timeout=2).stdout.split()
         except (OSError, subprocess.SubprocessError):
@@ -167,6 +201,14 @@ class DirtDisplayNode(Node):
         return [ip for ip in out if ':' not in ip and not ip.startswith(('127.', '172.17.'))]
 
     def _publish_stats(self):
+        """Publish Pi stats once a second.
+
+        Sends JSON on ``/dirt/pi/stats`` with any of ``cpu``, ``mem``, ``disk`` (all
+        percent), ``uptime`` (seconds), ``ips`` and ``web_port``. A stat that cannot
+        be read (for example on a non-Linux machine) is left out rather than failing.
+        IP addresses are refreshed every 10 s. Also publishes the CPU temperature as a
+        ``sensor_msgs/Temperature``.
+        """
         stats = {}
         try:
             idle, total = self._read_cpu()
@@ -213,6 +255,8 @@ class DirtDisplayNode(Node):
 
     # ---------- e-stop gate ----------
     def _on_estop(self, msg):
+        """Track the e-stop state, log changes, and send an immediate zero velocity if the gate is on.
+        """
         if bool(msg.data) != self.estop:
             self.estop = bool(msg.data)
             if self.estop:
@@ -223,14 +267,19 @@ class DirtDisplayNode(Node):
                 self.gate_pub.publish(Twist())
 
     def _on_cmd(self, msg):
+        """Gate callback: pass the velocity command through, or send zero while the e-stop is engaged.
+        """
         self.gate_pub.publish(Twist() if self.estop else msg)
 
     def _hold_stop(self):
+        """Re-send zero velocity at 10 Hz while the e-stop is engaged, in case anything else publishes.
+        """
         if self.estop:
             self.gate_pub.publish(Twist())
 
 
 def main():
+    """Start ROS 2, spin the node until Ctrl+C, then shut down cleanly."""
     rclpy.init()
     node = DirtDisplayNode()
     try:

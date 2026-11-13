@@ -56,6 +56,10 @@ DEFAULT_CONTROL = "pursuit"
 # Traction coeff = max tractive force / normal load; atan(mu) is roughly the
 # steepest slope the treads can grip. Ballpark values for rubber treads,
 # override with --traction / --rolling-resistance once you've measured them.
+# NOTE: only the rolling-resistance value is used right now. The traction
+# coefficient is not applied anywhere yet (RoverSim.traction_limited is never
+# set to True), and the --traction / --rolling-resistance flags do not exist
+# yet; override through RoverParams for now.
 SURFACE: Dict[str, Tuple[float, float]] = {
     "farmland": (0.08, 0.65),   # tilled soil
     "grassland": (0.06, 0.70),
@@ -83,14 +87,17 @@ GRAVITY = 9.81
 
 
 def clamp(value: float, low: float, high: float) -> float:
+    """Limit ``value`` to the range [low, high]."""
     return max(low, min(high, value))
 
 
 def wrap_angle_rad(angle: float) -> float:
+    """Wrap an angle in radians to [-pi, pi)."""
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def wrap_angle_deg(angle: float) -> float:
+    """Wrap an angle in degrees to [-180, 180)."""
     return (angle + 180.0) % 360.0 - 180.0
 
 
@@ -116,26 +123,41 @@ class MotorSpec:
 
     @property
     def free_rad_s(self) -> float:
+        """Motor (not output) free speed in rad/s."""
         return self.free_rpm * 2.0 * math.pi / 60.0
 
     @property
     def resistance_ohm(self) -> float:
+        """Winding resistance, R = V / I_stall (at stall there is no back-EMF)."""
         return self.voltage_v / self.stall_current_a
 
     @property
     def kt_nm_per_a(self) -> float:
+        """Torque constant in N*m/A.
+
+        ``stall_torque / (stall_current - free_current)``: the free current is the
+        part that only overcomes internal friction and makes no output torque.
+        """
         return self.stall_torque_nm / (self.stall_current_a - self.free_current_a)
 
     @property
     def ke_v_s_per_rad(self) -> float:
+        """Back-EMF constant in V*s/rad.
+
+        At free speed the supply voltage minus the resistive drop from the free
+        current equals the back-EMF, so ``Ke = (V - I_free * R) / w_free``.
+        """
         return (self.voltage_v - self.free_current_a * self.resistance_ohm) / self.free_rad_s
 
     @property
     def output_free_rpm(self) -> float:
+        """Gearbox output free speed in rpm (6000 / 40 = 150 rpm by default)."""
         return self.free_rpm / self.gear_ratio
 
     @property
     def output_stall_torque_nm(self) -> float:
+        """Gearbox output stall torque in N*m, after gearbox losses (about 3.4 N*m by default).
+        """
         return self.stall_torque_nm * self.gear_ratio * self.gearbox_efficiency
 
     def available_output_torque(self, output_rad_s: float, braking: bool = False) -> float:
@@ -154,6 +176,11 @@ class MotorSpec:
         return self.stall_torque_nm * factor * self.gear_ratio * self.gearbox_efficiency
 
     def current_for_output_torque(self, output_torque_nm: float) -> float:
+        """Current needed to make ``output_torque_nm`` at the output shaft.
+
+        Converts back through the gearbox to motor torque, divides by Kt, and adds
+        the free current.
+        """
         motor_torque = abs(output_torque_nm) / (self.gear_ratio * self.gearbox_efficiency)
         return self.free_current_a + motor_torque / self.kt_nm_per_a
 
@@ -186,13 +213,24 @@ class RoverParams:
 
     @property
     def max_track_speed_mps(self) -> float:
+        """Top tread speed in m/s: output free speed times the sprocket radius.
+
+        About 0.79 m/s with the defaults (150 rpm, 0.05 m sprocket). Control
+        profiles that ask for more are clamped to this.
+        """
         return self.motor.output_free_rpm * 2.0 * math.pi / 60.0 * self.sprocket_radius_m
 
     @property
     def max_yaw_rate_rad_s(self) -> float:
+        """Fastest turn in place in rad/s.
+
+        Both treads at top speed in opposite directions give ``2 * v_max / gauge``;
+        ``turn_slip`` then removes the share of that lost to the treads skidding.
+        """
         return 2.0 * self.max_track_speed_mps / self.track_gauge_m * (1.0 - self.turn_slip)
 
     def track_to_rpm(self, track_mps: float) -> float:
+        """Convert a tread surface speed in m/s to gearbox output rpm."""
         return track_mps / self.sprocket_radius_m * 60.0 / (2.0 * math.pi)
 
 
@@ -204,6 +242,12 @@ class TerrainField:
     """Analytic height field. height() accepts scalars or numpy arrays."""
 
     def __init__(self, span_m: float = 48.0, terrain_mode: str = DEFAULT_TERRAIN):
+        """Pick the terrain.
+
+        Args:
+            span_m: Width and length of the square world in metres, centred on 0.
+            terrain_mode: One of ``TERRAIN_PROFILES``. Unknown names use the default.
+        """
         self.span_m = span_m
         self.terrain_mode = terrain_mode if terrain_mode in TERRAIN_PROFILES else DEFAULT_TERRAIN
 
@@ -220,6 +264,16 @@ class TerrainField:
         return np.minimum(up, down)
 
     def _testyard(self, x, y, want_angle: bool = False):
+        """Height (or ramp angle) for the test yard.
+
+        Each lane in ``testyard_lanes()`` is a trapezoid ramp along X: up-slope,
+        flat deck, down-slope. ``lateral`` fades each ramp to 0 over
+        ``TESTYARD_WALL_M`` at its sides. Where lanes overlap the taller one wins.
+
+        Args:
+            x, y: Scalars or numpy arrays in metres.
+            want_angle: Return the lane's nominal angle in degrees instead of height.
+        """
         x = np.asarray(x, dtype=float)
         y = np.asarray(y, dtype=float)
         along = self._ramp_profile(x)
@@ -239,6 +293,16 @@ class TerrainField:
         return self._testyard(x, y, want_angle=True)
 
     def height(self, x, y):
+        """Ground height in metres at (x, y).
+
+        Every terrain except the test yard is a sum of sines and cosines, so it is
+        smooth, repeatable and cheap to evaluate on a whole grid. The wavelength in
+        each term (the divisor) sets how wide a hill is and the coefficient sets its
+        height. Farmland adds small crop-row ridges along X.
+
+        Args:
+            x, y: Scalars or numpy arrays (broadcast together).
+        """
         mode = self.terrain_mode
         if mode == "testyard":
             return self._testyard(x, y)
@@ -269,11 +333,22 @@ class TerrainField:
         )
 
     def gradient(self, x, y, delta: float = 0.15):
+        """Slope of the ground as (dz/dx, dz/dy), by central differences.
+
+        Args:
+            delta: Half the sample spacing in metres. Larger smooths over small bumps.
+        """
         dx = (self.height(x + delta, y) - self.height(x - delta, y)) / (2.0 * delta)
         dy = (self.height(x, y + delta) - self.height(x, y - delta)) / (2.0 * delta)
         return dx, dy
 
     def height_and_gradient_grid(self, xs: np.ndarray, ys: np.ndarray, delta: float = 0.05):
+        """Evaluate the terrain on a grid, for building the 3D mesh.
+
+        Returns:
+            (gx, gy, z, sx, sy): meshgrid coordinates, heights and slopes, all the
+            same 2-D shape.
+        """
         gx, gy = np.meshgrid(xs, ys)
         z = self.height(gx, gy)
         sx, sy = self.gradient(gx, gy, delta)
@@ -282,6 +357,15 @@ class TerrainField:
 
 @dataclass(frozen=True)
 class Obstacle:
+    """A tree or rock the rover must drive around.
+
+    Attributes:
+        name: Unique label, used in collision logs.
+        kind: ``"tree"`` or ``"rock"``.
+        x, y: Centre in metres.
+        scale: Size multiplier for both the collision radius and the 3D model.
+    """
+
     name: str
     kind: str  # "tree" or "rock"
     x: float
@@ -290,6 +374,7 @@ class Obstacle:
 
     @property
     def radius_m(self) -> float:
+        """Collision radius at ground level in metres."""
         # Footprint of the canopy/trunk (tree) or the boulder (rock) at ground level.
         return (0.40 if self.kind == "tree" else 0.32) * self.scale
 
@@ -314,6 +399,8 @@ DEFAULT_OBSTACLES: Tuple[Obstacle, ...] = (
 
 @dataclass
 class Waypoint3D:
+    """A target point on the ground (metres), with a name for logs and the HUD."""
+
     name: str
     x: float
     y: float
@@ -330,16 +417,37 @@ TESTYARD_RUNUP_X = 9.0  # lane entry/exit points, clear of the 5.5 m ramp ends
 
 
 def start_pose_for(terrain_mode: str) -> Tuple[float, float, float]:
+    """Return the start (x, y, heading_rad) for a terrain.
+
+    The test yard starts in front of the first, gentlest ramp.
+
+    Note: nothing calls this yet. ``RoverSim.reset`` always uses ``START_POSE``.
+    """
     if terrain_mode == "testyard":
         return (-TESTYARD_RUNUP_X - 1.0, testyard_lanes()[0][1], 0.0)
     return START_POSE
 
 
 def obstacles_for(terrain_mode: str) -> Tuple[Obstacle, ...]:
+    """Return the obstacles for a terrain (none in the test yard).
+
+    Note: nothing calls this yet. ``RoverSim`` uses ``DEFAULT_OBSTACLES`` unless
+    ``obstacles`` is passed in.
+    """
     return () if terrain_mode == "testyard" else DEFAULT_OBSTACLES
 
 
 def default_waypoints(terrain_mode: str = DEFAULT_TERRAIN) -> List[Waypoint3D]:
+    """Return the built-in route for a terrain.
+
+    The test yard gets a serpentine that drives every ramp, gentlest first; every
+    other terrain gets Start plus three sample sites.
+
+    Note: ``RoverSim`` calls this without a terrain, so a test yard run currently
+    gets the farmland route (and, with ``START_POSE`` and the default obstacles,
+    the farmland trees). Pass ``default_waypoints("testyard")`` and
+    ``obstacles_for("testyard")`` explicitly until that is wired in.
+    """
     if terrain_mode == "testyard":
         # Serpentine over every ramp, gentlest first.
         points = []
@@ -380,6 +488,7 @@ def random_waypoints(
 
 
 def load_waypoints_csv(path: str) -> List[Waypoint3D]:
+    """Load waypoints from a CSV with ``name,x,y`` columns (metres in the sim frame)."""
     with open(path, newline="") as handle:
         return [Waypoint3D(row["name"], float(row["x"]), float(row["y"])) for row in csv.DictReader(handle)]
 
@@ -390,6 +499,18 @@ def load_waypoints_csv(path: str) -> List[Waypoint3D]:
 
 @dataclass
 class RoverState:
+    """Where the rover is and how it is moving.
+
+    Attributes:
+        x, y, z: Position in metres. z rests on the terrain.
+        heading_deg: 0 = +X, counter-clockwise positive.
+        speed: Forward speed over the ground in m/s, after slip.
+        pitch_deg: Nose up positive.
+        roll_deg: Left side up positive.
+        yaw_rate_dps: Turn rate in degrees per second.
+        left_track_mps, right_track_mps: Tread surface speeds in m/s.
+    """
+
     x: float
     y: float
     heading_deg: float
@@ -404,6 +525,14 @@ class RoverState:
 
 @dataclass
 class RoverSample:
+    """One row of the path CSV.
+
+    The first block of columns matches the original OpenCV sim's logger so old
+    analysis scripts still work; the rest add drivetrain and mission data.
+    ``power_draw`` is in W, ``energy_wh`` is the running total, and
+    ``motor_limited`` is True when a motor could not supply the torque asked of it.
+    """
+
     # Columns from the original logger (kept, same order) ...
     step: int
     run_label: str
@@ -441,10 +570,15 @@ class RoverSample:
 
 @dataclass
 class MotionLog:
+    """Recorded ``RoverSample`` rows. ``every`` thins the log, which matters for long HPRC batch runs.
+    """
+
     rows: List[RoverSample] = field(default_factory=list)
     every: int = 1  # keep every Nth step (1 = all)
 
     def save_csv(self, path: str = "sim_rover_3d_path.csv") -> None:
+        """Write every row to ``path``, creating the folder if needed. Does nothing if empty.
+        """
         if not self.rows:
             return
         folder = os.path.dirname(path)
@@ -492,6 +626,23 @@ class RoverSim:
         run_label: str = "demo",
         log_every: int = 1,
     ):
+        """Set up a run.
+
+        Args:
+            waypoints: Route to follow. Defaults to ``default_waypoints()``.
+            terrain_mode: One of ``TERRAIN_PROFILES``.
+            control_mode: One of ``CONTROL_PROFILES`` (smooth, pursuit, aggressive).
+            terrain_span_m: World size in metres.
+            waypoint_tolerance_m: How close counts as arrived.
+            max_speed_mps, steering_gain, accel_mps2: Override the control profile.
+                Speed is still clamped to the motors' top speed.
+            params: Rover physical parameters. Defaults to ``RoverParams()``.
+            obstacles: Trees and rocks to avoid.
+            mission_mode: True runs the full drill and measure sequence at each
+                waypoint; False just drives the route.
+            run_label: Label written into every CSV row.
+            log_every: Keep every Nth step in the log.
+        """
         if control_mode not in CONTROL_PROFILES:
             log.warning("Unknown control mode %r, using %s", control_mode, DEFAULT_CONTROL)
             control_mode = DEFAULT_CONTROL
@@ -535,6 +686,8 @@ class RoverSim:
     # ---------------------------------------------------------------- setup
 
     def reset(self) -> None:
+        """Put the rover back at ``START_POSE`` and clear all mission progress, counters and the log.
+        """
         x, y, h = START_POSE
         self.state = RoverState(x=x, y=y, heading_deg=math.degrees(h))
         self.target_idx = 0
@@ -568,6 +721,8 @@ class RoverSim:
         self._update_pose_on_terrain()
 
     def add_waypoint(self, x: float, y: float, name: Optional[str] = None) -> Waypoint3D:
+        """Append a waypoint (for example from a mouse click in the viewer) and resume if the run had finished.
+        """
         waypoint = Waypoint3D(name or f"Field {len(self.waypoints)}", x, y)
         self.waypoints.append(waypoint)
         if self.finished:
@@ -575,6 +730,7 @@ class RoverSim:
         return waypoint
 
     def current_waypoint(self) -> Optional[Waypoint3D]:
+        """The waypoint being driven to, or None when the route is done."""
         if self.target_idx >= len(self.waypoints):
             return None
         return self.waypoints[self.target_idx]
@@ -723,6 +879,8 @@ class RoverSim:
         v = 0.5 * (s.left_track_mps + s.right_track_mps) * (1.0 - self.wheel_slip)
         omega = (s.right_track_mps - s.left_track_mps) / p.track_gauge_m * (1.0 - p.turn_slip)
 
+        # Integrate with the heading at the middle of the step (midpoint rule),
+        # which tracks curves more accurately than using the start heading.
         heading = math.radians(s.heading_deg) + omega * dt * 0.5
         dx = math.cos(heading) * v * dt
         dy = math.sin(heading) * v * dt
@@ -742,11 +900,17 @@ class RoverSim:
         self._update_pose_on_terrain()
 
     def _limit_to_world(self) -> None:
+        """Keep the rover's footprint inside the square world."""
         half = self.terrain.span_m / 2.0 - self.params.footprint_radius_m
         self.state.x = clamp(self.state.x, -half, half)
         self.state.y = clamp(self.state.y, -half, half)
 
     def _resolve_collisions(self) -> None:
+        """Push the rover out of any obstacle it overlaps.
+
+        Counts a new collision only on first contact with each obstacle, so sliding
+        along one counts once.
+        """
         s = self.state
         touching = set()
         for obs in self.obstacles:
@@ -776,11 +940,13 @@ class RoverSim:
     # --------------------------------------------------------------- stepping
 
     def _step_manual(self, dt: float) -> None:
+        """Drive from the UI's throttle and steer inputs (each -1..1)."""
         v = self.max_speed_mps * clamp(self.manual_throttle, -1.0, 1.0)
         omega = self.params.max_yaw_rate_rad_s * clamp(self.manual_steer, -1.0, 1.0)
         self._apply_drivetrain(*self._tracks_from_body(v, omega), dt)
 
     def _advance_waypoint(self, reached: bool) -> None:
+        """Move to the next waypoint, logging it as reached or skipped (timed out)."""
         target = self.current_waypoint()
         if target is not None:
             if reached:
@@ -792,6 +958,8 @@ class RoverSim:
         self.waypoint_timer = 0.0
 
     def _step_autonomous(self, dt: float) -> None:
+        """Drive to each waypoint in turn with no tool phases (``mission_mode`` False).
+        """
         target = self.current_waypoint()
         if target is None:
             self._apply_drivetrain(0.0, 0.0, dt)
@@ -804,6 +972,18 @@ class RoverSim:
             self._advance_waypoint(False)
 
     def _step_mission(self, dt: float) -> None:
+        """One step of the drill-and-measure mission at the current waypoint.
+
+        Phases, in order (see ``MISSION_PHASES``):
+
+        1. drive_to_drill: drive to the waypoint with obstacle avoidance.
+        2. lower_drill, drill_spin (2 s, +25 W placeholder load), raise_drill.
+        3. drive_to_measure: creep straight ahead ``DRILL_TO_PROBE_M`` so the probe
+           at the back sits over the hole the drill at the front made.
+        4. lower_measure, measure_hold (1.1 s), raise_measure, then the next waypoint.
+
+        Timings and the drill load are placeholders until real drill tests.
+        """
         target = self.current_waypoint()
         if target is None:
             self._apply_drivetrain(0.0, 0.0, dt)
@@ -905,6 +1085,8 @@ class RoverSim:
         return self.finished and not self.manual_mode
 
     def set_mission_mode(self, enabled: bool) -> None:
+        """Switch the drill/measure sequence on or off and restart it from the driving phase.
+        """
         self.mission_mode = enabled
         self.mission_phase = "drive_to_drill"
         self.mission_hold_timer = 0.0
@@ -914,6 +1096,11 @@ class RoverSim:
     # --------------------------------------------------------------- logging
 
     def target_geometry(self) -> Tuple[float, float]:
+        """Return (distance_m, bearing_deg) to the current waypoint.
+
+        Bearing is relative to the rover's heading: 0 straight ahead, positive to
+        the left.
+        """
         target = self.current_waypoint()
         if target is None:
             return 0.0, 0.0
@@ -922,6 +1109,7 @@ class RoverSim:
         return math.hypot(dx, dy), bearing
 
     def _record(self) -> None:
+        """Append one ``RoverSample`` row for the current step."""
         s, p = self.state, self.params
         target = self.current_waypoint()
         distance, bearing = self.target_geometry()
@@ -963,6 +1151,8 @@ class RoverSim:
         )
 
     def summary(self) -> Dict[str, object]:
+        """Return run totals (time, distance, energy, peak current, max tilt, collisions, samples) as a dict.
+        """
         rows = self.log.rows
         mean_power = (self.energy_j / self.sim_time_s) if self.sim_time_s > 0 else 0.0
         peak_current = max((max(r.left_current_a, r.right_current_a) for r in rows), default=0.0)
@@ -1000,6 +1190,15 @@ def run_headless(
     params: Optional[RoverParams] = None,
     log_every: int = 1,
 ) -> RoverSim:
+    """Run one simulation with no graphics and return the finished ``RoverSim``.
+
+    Stops when every waypoint is done or after ``max_time_s`` of sim time.
+
+    Args:
+        dt: Physics timestep in seconds.
+        csv_path: Where to write the path log. None skips it.
+        Other arguments are passed to ``RoverSim``.
+    """
     sim = RoverSim(
         waypoints=waypoints,
         terrain_mode=terrain_mode,
@@ -1058,6 +1257,7 @@ def run_batch(
 
 
 def print_summary(summary: Dict[str, object]) -> None:
+    """Print a summary dict as aligned ``key : value`` lines."""
     print("\nRover Simulation Summary")
     width = max(len(k) for k in summary)
     for key, value in summary.items():
@@ -1082,6 +1282,8 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
 
 
 def params_from_args(args: argparse.Namespace) -> RoverParams:
+    """Build ``RoverParams`` from the CLI, applying any --mass, --sprocket-radius or --track-gauge overrides.
+    """
     params = RoverParams()
     if args.mass is not None:
         params.mass_kg = args.mass
@@ -1093,6 +1295,8 @@ def params_from_args(args: argparse.Namespace) -> RoverParams:
 
 
 def waypoints_from_args(args: argparse.Namespace) -> Optional[List[Waypoint3D]]:
+    """Return waypoints from --waypoints or --random-waypoints, or None for the default route.
+    """
     if args.waypoints:
         return load_waypoints_csv(args.waypoints)
     if args.random_waypoints > 0:
@@ -1101,6 +1305,7 @@ def waypoints_from_args(args: argparse.Namespace) -> Optional[List[Waypoint3D]]:
 
 
 def main() -> None:
+    """Command-line entry point. Run with ``--help`` for the options."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
     parser = argparse.ArgumentParser(description="DIRT rover simulation, headless (no graphics)")
     add_common_args(parser)

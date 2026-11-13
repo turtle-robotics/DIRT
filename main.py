@@ -1,22 +1,33 @@
-"""
-DIRT Bot – Main Entry Point
-=============================
+"""DIRT main entry point.
+
 Runs the complete autonomous soil sampling sequence:
-  GPS navigate → SLAM fine-position → Vision align → Drill → Measure → Repeat
+GPS navigate -> SLAM fine-position -> vision align -> drill -> measure -> repeat.
 
-Usage:
-  # Full simulation (no hardware):
-  python main.py
+Usage::
 
-  # Real hardware:
-  # 1. Edit config.py → set PLATFORM = Platform.RASPBERRY_PI
-  # 2. python main.py --waypoints waypoints.csv
+    # Full simulation (no hardware):
+    python main.py
 
-  # Single-subsystem tests:
-  python main.py --test alignment
-  python main.py --test spectrometer
-  python main.py --test distance
-  python main.py --test navigation
+    # Real hardware:
+    #   1. Edit config.py and set PLATFORM (check every pin and port first)
+    #   2. python main.py --waypoints waypoints.csv      (columns: name,lat,lon)
+
+    # Farm mission from a CSV (columns: name,lat,lon,action,tolerance_m).
+    # GPS-only: no alignment, drilling or measuring.
+    python main.py --mission w
+
+    # Single-subsystem tests:
+    python main.py --test alignment
+    python main.py --test spectrometer
+    python main.py --test distance
+    python main.py --test navigation
+    python main.py --test rover3d
+
+    # Alignment controller parameter sweep:
+    python main.py --sweep
+
+If several options are given, only the first match runs, in this order:
+``--test``, ``--sweep``, ``--mission``, then the full mission.
 """
 
 from __future__ import annotations
@@ -70,7 +81,7 @@ def _run_spectrometer_test():
 
 
 def _run_distance_test():
-    """Distance sensor session capture."""
+    """Record a 5 s distance sensor session and save it to ``distance_session.csv``."""
     from core.distance_sensor import DistanceSensor
     log.info("Running distance sensor test…")
     with DistanceSensor() as sensor:
@@ -116,7 +127,8 @@ def _run_mission_from_csv(path: str):
 
 
 def _run_rover_3d_test():
-    """Full 3D rover motion demo over terrain."""
+    """Full 3D rover motion demo over terrain. Uses Panda3D if it imports, otherwise the OpenCV sim.
+    """
     try:
         from simulation.rover_3d_panda import run_rover_3d_demo
         log.info("Running 3D rover demo with Panda3D…")
@@ -127,7 +139,11 @@ def _run_rover_3d_test():
 
 
 def _load_waypoints_csv(path: str):
-    """Load waypoints from a CSV with columns: name,lat,lon"""
+    """Load waypoints from a CSV with columns: name,lat,lon.
+
+    Unlike ``Navigator.from_csv``, this needs exactly those column names and
+    ignores ``action`` and ``tolerance_m``.
+    """
     from navigation.navigator import Waypoint, GPSCoord
     waypoints = []
     with open(path) as f:
@@ -141,9 +157,20 @@ def _load_waypoints_csv(path: str):
 
 
 def _run_full_mission(waypoints_csv: Optional[str] = None):
-    """
-    Full autonomous mission:
-    GPS navigate → SLAM → Vision align → Drill → Measure → next waypoint
+    """Full autonomous mission:
+    GPS navigate -> SLAM -> vision align -> drill -> measure -> next waypoint.
+
+    ``Navigator.step`` tracks the state; this loop does the work for the
+    ALIGNING, DRILLING and MEASURING states and then calls the matching
+    ``notify_*`` method to move on. If alignment fails, that waypoint is skipped.
+    Results are written to ``mission_results.json`` in the current folder.
+
+    Drilling is a placeholder: it reads the distance sensor until it reports
+    15 cm or less, and does not command a drill motor.
+
+    Args:
+        waypoints_csv: Optional CSV with ``name,lat,lon`` columns. Two built-in
+            test waypoints are used if not given.
     """
     from navigation.navigator import Navigator, Waypoint, GPSCoord, NavState
     from core.alignment_system import AlignmentControlSystem, SystemState
